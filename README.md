@@ -75,7 +75,7 @@ O binário resultante é gerado por TypePHP a partir de PHP, e não pelo interpr
 
 O objetivo desta primeira etapa é validar apenas o caminho completo: instalar toolchain isolada, compilar PHP com TypePHP e executar o binário nativo. **O Hello World sem Swoole já foi compilado e executado com sucesso no ambiente local. A variante com Swoole ainda não foi validada após esta alteração.**
 
-Próximos experimentos: confirmar integração de Swoole com sockets UDP no AOT, criar parser RTP e introduzir decodificação/gravação G.711 PCMA/PCMU. A configuração do `php-builder` já solicita Swoole explicitamente, mas é necessário confirmar a compilação, a presença da classe `Swoole\\Server` no executável e o funcionamento real de sockets UDP.
+Próximos experimentos: confirmar integração de Swoole com sockets UDP no AOT, criar parser RTP e introduzir decodificação/gravação G.711 PCMA/PCMU. A configuração do `php-builder` já solicita Swoole explicitamente, mas é necessário confirmar a compilação, a presença da classe `Swoole\Server` no executável e o funcionamento real de sockets UDP.
 
 ### Fontes técnicas
 
