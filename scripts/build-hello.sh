@@ -22,7 +22,10 @@ docker run --rm \
   --volume "$ROOT:/workspace" \
   --workdir /workspace \
   "$IMAGE" \
-  php /opt/typephp/vendor/bin/tpc.php examples/hello.php --php-builder --build-dir /workspace/.toolchain/build -o bin/hello
+  php /opt/typephp/vendor/bin/tpc.php examples/hello.php \
+    --php-builder='extensions: [swoole, posix]; zts: off' \
+    --build-dir /workspace/.toolchain/build \
+    -o bin/hello
 
 if [[ ! -f "$ROOT/bin/hello" ]]; then
   printf 'Erro: compilacao nao produziu bin/hello.\n' >&2
