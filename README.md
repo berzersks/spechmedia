@@ -2,7 +2,7 @@
 
 Biblioteca e futuro motor de telefonia VoIP em PHP, compilada com [TypePHP](https://github.com/swoole/typephp) (AOT) e Swoole.
 
-A primeira versão origina chamadas SIP por UDP e interpreta SDP de áudio. O endereço e a porta de mídia pertencem à aplicação que fornece a oferta.
+A primeira versão origina chamadas SIP por UDP e interpreta SDP de áudio. A oferta SDP pode ser preparada automaticamente ou fornecida pela aplicação de mídia.
 
 ## Início rápido — Linux AMD64 / ARM64
 
@@ -34,31 +34,37 @@ O exemplo mínimo está em [hello.php](hello.php).
 
 ## Testar uma chamada de saída
 
-Prepare a toolchain conforme o passo 1. Em `example.php`, substitua os valores de `domain`, `username` e `password` no construtor de `SipUserAgent` antes de compilar. Esses valores ficam incorporados ao executável. Na raiz do projeto, configure o endereço de uma interface local, o par UDP que receberá a sinalização e um destino de teste. Os endereços abaixo são reservados para documentação. Substitua-os pelos seus.
+Em `example.php`, ajuste `server`, `username`, `password` e `$destination`. As credenciais ficam incorporadas ao executável. A porta UDP do provedor é 5060 por padrão; para alterá-la, passe `serverPort: 5070` no construtor. A duração após o atendimento é de 10 segundos, configurável com `SIP_CALL_SECONDS`.
 
 ```bash
-export SIP_LOCAL_IP=192.0.2.10
-export SIP_LOCAL_PORT=5062
-export SIP_PEER_IP=192.0.2.20
-export SIP_PEER_PORT=5060
-export SIP_DESTINATION=1002
-export SIP_CALL_SECONDS=10
-
-# Informe um endpoint de mídia sob controle da aplicação.
-export MEDIA_IP=192.0.2.10
-export MEDIA_PORT=40000
-
 bin/tpc.php example.php -O2
 ./example
 ```
 
-A execução de `./example` registra o contato, chama o destino e encerra a chamada após o intervalo contado a partir do atendimento. Também aceita uma URI completa em `SIP_DESTINATION`. As portas SIP têm padrão 5060 e a duração tem padrão de 10 segundos. O exemplo exige `MEDIA_IP` e `MEDIA_PORT` explicitamente. O SpechMedia apenas os anuncia no SDP. A aplicação proprietária da porta é responsável por toda a mídia.
+Dentro de uma corrotina Swoole, o fluxo mínimo é:
+
+```php
+$sip = new SipUserAgent(server: 'sip.provedor.com.br', username: '1001', password: 'senha');
+$sip->start();
+try {
+    $sip->register();
+    try {
+        $call = $sip->createCall('5569999999999');
+        $call->invite();
+        $call->waitForEnd();
+    } finally {
+        $sip->unregister();
+    }
+} finally {
+    $sip->stop();
+}
+```
 
 O launcher reconhece o arquivo de entrada da raiz e seleciona [example.yml](example.yml). O manifesto inclui `example.php` e a árvore `src/` na unidade de compilação. O ponto de entrada é a função global `main(): void`. Para outro binário que consuma a biblioteca, inclua seu ponto de entrada e o diretório `src/` no respectivo manifesto TypePHP.
 
 ### Sinalização disponível
 
-- `SipUserAgent` faz bind em um IPv4 local específico e conecta o socket UDP ao PBX/proxy configurado. Todos os pedidos de diálogo passam por esse mesmo próximo salto. O PBX ou proxy precisa encaminhar a sinalização de retorno pelo mesmo IP e porta. O endereço local anunciado no Contact precisa ser alcançável pelo par.
+- `start()` resolve o IPv4 do servidor e conecta um único socket UDP. O bind padrão usa `0.0.0.0:0`. Depois de conectar, a biblioteca lê o IPv4 escolhido pela rota e a porta atribuída pelo sistema operacional. Esses valores alimentam Via e Contact. O PBX ou proxy deve retornar a sinalização pelo mesmo próximo salto.
 - `register(timeout: 5)` retorna a resposta de sucesso e lança uma exceção em caso de falha. `unregister()` usa o mesmo contato e Call-ID, incrementa o CSeq e solicita validade zero. O registro dura o prazo aceito pelo servidor. Aplicações longas devem chamar `register()` novamente antes da expiração. A primeira versão não agenda renovação automática nem negocia 423/Min-Expires.
 - REGISTER, INVITE e BYE aceitam desafios 401 e 407, inclusive proxy e servidor em sequência. Digest admite MD5, SHA-256 e variantes sess, com qop auth ou sem qop. Um segundo desafio da mesma origem encerra a tentativa. Auth-int, recuperação de nonce stale e múltiplos realms sucessivos do mesmo tipo ficam fora desta versão.
 - Cada `SipCall` mantém seu Call-ID, tags, CSeq, oferta e estado. O motor distingue os ACKs transacionais dos ACKs de diálogo, aplica Contact e Record-Route, aceita retransmissões e encerra diálogos adicionais de um fork com ACK e BYE. CANCEL aguarda a primeira provisória. A resposta ao INVITE determina o resultado, inclusive quando o atendimento cruza com o cancelamento. BYE remoto é validado pelas tags e tem a resposta armazenada para retransmissão.
@@ -66,11 +72,33 @@ O launcher reconhece o arquivo de entrada da raiz e seleciona [example.yml](exam
 - Os callbacks recebem `(SipCall $call, ?SipMessage $message, string $reason)`. São entregues em ordem, numa corrotina por chamada enquanto houver eventos pendentes. Uma espera cooperativa dentro de um callback permite que a recepção continue. Trabalho de CPU e I/O bloqueante continuam sujeitos às regras do event loop do Swoole. Sob saturação da fila, eventos provisórios podem ser descartados. `waitForEnd()` acompanha o estado da sinalização. `stop()` libera o transporte imediatamente. Para encerramento normal use `hangup()`, `waitForEnd()`, `unregister()` e então `stop()`.
 - O argumento `log: true` habilita registros de método e status. Cabeçalhos de autenticação e corpos ficam fora do log do motor.
 
+### Endereços locais, NAT e mídia
+
+| Configuração opcional | Efeito |
+| --- | --- |
+| Construtor: `localIp`, `localPort` | Interface e porta de bind SIP. A porta zero solicita uma porta disponível. |
+| Construtor: `advertisedIp`, `advertisedPort` | Endereço e porta publicados em Via e Contact. Úteis quando existe um mapeamento NAT conhecido. |
+| Construtor: `domain` | Domínio SIP da conta e das URIs, caso seja diferente do próximo salto definido por `server`. |
+| `createCall()`: `mediaBindIp`, `mediaPort` | Bind da reserva UDP por chamada. O padrão é o IPv4 local da sinalização e porta zero. |
+| `createCall()`: `mediaIp`, `advertisedMediaPort` | Endereço anunciado em `c=` e porta anunciada em `m=audio`. Por padrão, correspondem à reserva de mídia. |
+| `createCall()`: `codecs`, `ptime` | Nomes `PCMA` e/ou `PCMU`, na ordem desejada, e intervalo em milissegundos. Padrão: ambos, nessa ordem, e 20 ms. |
+| `createCall($destino, offer: $sdp)` | Usa a descrição fornecida e deixa a posse da porta com o componente externo. Esta opção substitui a geração automática. |
+
+A descoberta da rota identifica o IP de origem local. Em uma rede com NAT ela pode retornar um IP privado. Os overrides SIP e SDP são independentes e devem refletir mapeamentos alcançáveis pelo par. A biblioteca não descobre o IP público nem cria redirecionamentos de porta.
+
+A oferta automática reserva um socket UDP em `createCall()` e anuncia `a=inactive`: ainda não existe processamento RTP. Se o provedor responder com outra direção ou omitir o atributo, a chamada de sinalização pode ser atendida com a mídia local inativa. O SDP remoto permanece disponível exatamente como recebido. Ofertas explícitas continuam a exigir uma direção compatível na resposta. Chamadas simultâneas mantêm reservas independentes. Encerramento, falha, descarte de uma chamada ainda não iniciada e `stop()` liberam a reserva. Para anunciar mídia ativa gerenciada por outro componente, use um `SdpSession` explícito.
+
+**Consulta sem alocação.** Durante a execução, `getLocalIp()` e `getLocalPort()` informam o socket SIP efetivo; `getServerIp()` informa o IPv4 resolvido e `getServerPort()` a porta configurada. `getAdvertisedIp()` e `getAdvertisedPort()` informam o endereço publicado. Antes de `start()` e depois de `stop()`, os getters de endpoint retornam `null`, exceto a porta configurada do servidor.
+
+Na chamada, `getLocalSdp()`, `getLocalMediaIp()` e `getLocalMediaPort()` descrevem a oferta daquela chamada e continuam consultáveis após o fim. `getMediaBindIp()` e `getMediaBindPort()` informam a reserva **enquanto ela existe**. Para SDP externo, retornam `null`. `getRemoteSdp()` retorna `null` até a chegada de um SDP remoto válido.
+
+**Migração.** O construtor agora começa por `server, username, password`. Para um antigo par `domain/peerIp`, use `server: $peerIp, domain: $domain` ou simplesmente `server: $domain` quando o DNS apontar para o provedor. Transportes injetados implementam `open(string $localIp, int $localPort, UdpEndpoint $server): UdpEndpoint`, retornando o endpoint local efetivo.
+
 ### SDP e limites de interoperabilidade
 
 `new SdpSession($ip, $porta)` oferece PCMA (8) e PCMU (0), ptime de 20 ms e direção sendrecv. Também é possível passar `SdpSession::parse($texto)` a `createCall()` para preservar um SDP preparado externamente. O perfil suportado contém um único fluxo de áudio IPv4 RTP/AVP. `remoteSdp()` fornece endereço, porta, payloads, ptime e direção **do par**. `negotiatedPayloads()` retorna a interseção G.711, na ordem da resposta. Uma resposta final pode aproveitar o SDP provisório do mesmo diálogo. Uma resposta aceita sem áudio compatível recebe ACK seguido de BYE.
 
-Esta versão pressupõe um único próximo salto UDP, sem descoberta DNS/SRV, travessia automática de NAT, TCP, TLS ou IPv6. Não recebe novos INVITEs como UAS. PRACK/100rel, UPDATE, re-INVITE, REFER, ICE, SRTP e sessões com vários fluxos ficam para etapas futuras. Nenhum socket RTP/RTCP é aberto e não há codificação, áudio, DTMF ou gravação.
+Esta versão pressupõe um único próximo salto UDP, com resolução IPv4 de nome e sem descoberta SRV, travessia automática de NAT, TCP, TLS ou IPv6. Não recebe novos INVITEs como UAS. PRACK/100rel, UPDATE, re-INVITE, REFER, ICE, SRTP e sessões com vários fluxos ficam para etapas futuras. A reserva UDP não envia nem processa RTP ou RTCP. Não há codificação, áudio, DTMF ou gravação.
 
 ## Outros comandos
 
@@ -106,6 +134,6 @@ A primeira compilação com Swoole pode precisar construir o PHP privado; compil
 
 ## Estado de validação
 
-Já foi comprovada a compilação AOT de um Hello World e observada a inicialização dos workers Swoole após a correção manual no cache. O **novo launcher e a automação** passaram por verificações locais de sintaxe, argumentos e idempotência do patch, mas ainda precisam de validação end-to-end em uma instalação Docker limpa. Os testes de sinalização em [tests/signaling.php](tests/signaling.php) usam transporte em memória. Cobrem autenticação, retransmissão, timeout, chamadas simultâneas, ACK duplicado, CANCEL cruzado com atendimento, SDP provisório e BYE remoto. A compilação do exemplo SIP e a interoperabilidade UDP com um PBX aguardam validação manual.
+Já foi comprovada a compilação AOT de um Hello World e observada a inicialização dos workers Swoole após a correção manual no cache. O **novo launcher e a automação** passaram por verificações locais de sintaxe, argumentos e idempotência do patch, mas ainda precisam de validação end-to-end em uma instalação Docker limpa. Os testes de sinalização em [tests/signaling.php](tests/signaling.php) usam mensagens SIP em memória e sockets de loopback para verificar a seleção dos endpoints e o ciclo de vida das reservas. Cobrem autenticação, retransmissão, timeout, chamadas simultâneas, ACK duplicado, CANCEL cruzado com atendimento, SDP provisório e BYE remoto. A compilação do exemplo SIP e a interoperabilidade UDP com um PBX aguardam validação manual.
 
 Referências: [TypePHP](https://github.com/swoole/typephp) · [PHP builder](https://github.com/swoole/typephp/blob/master/docs/en/LIBPHP_INSTALLER.md).

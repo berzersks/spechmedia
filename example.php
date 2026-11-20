@@ -1,7 +1,6 @@
 <?php
 declare(strict_types=1);
 
-use SpechMedia\Sdp\SdpSession;
 use SpechMedia\Sip\SipCall;
 use SpechMedia\Sip\SipMessage;
 use SpechMedia\Sip\SipUserAgent;
@@ -10,20 +9,68 @@ use Swoole\Coroutine;
 function main(): void
 {
     Coroutine::set(['hook_flags' => 0]);
-    \Swoole\Coroutine\run(static function (): void {
+
+    Co\run(static function (): void {
         $sip = null;
         $registered = false;
+
+
+        $prevStat = null;
+
+       go(function (){
+         for ($ix = 0; $ix < 10; $ix++) {
+             // Lê apenas a primeira linha do /proc/stat (total de todas as CPUs)
+             $handle = fopen('/proc/stat', 'r');
+             if (!$handle) {
+                 return;
+             }
+             $line = fgets($handle);
+             fclose($handle);
+
+             // Extrai os valores numéricos: user, nice, system, idle, iowait, irq, softirq, steal
+             preg_match('/^cpu\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/', $line, $matches);
+             if (empty($matches)) {
+                 return;
+             }
+
+             array_shift($matches); // Remove o match completo da string
+             $currentStat = array_map('intval', $matches);
+
+             // Na primeira execução, apenas armazena a base de comparação
+             if ($prevStat === null) {
+                 $prevStat = $currentStat;
+                 return;
+             }
+
+             // Calcula a diferença de ciclos desde o último tick (1 segundo atrás)
+             $deltas = [];
+             foreach ($currentStat as $i => $val) {
+                 $deltas[$i] = $val - $prevStat[$i];
+             }
+             $prevStat = $currentStat;
+
+             $totalDelta = array_sum($deltas);
+             if ($totalDelta === 0) {
+                 return;
+             }
+
+             // Índice 3 = idle, Índice 4 = iowait
+             $idleDelta = $deltas[3] + $deltas[4];
+             $cpuUsage = (($totalDelta - $idleDelta) / $totalDelta) * 100;
+
+             echo sprintf("$ix - Uso de CPU: %.2f%%\n", $cpuUsage);
+            Coroutine::sleep(1);
+            echo microtime(true).PHP_EOL;
+
+         }
+       });
 
         try {
             // 1. Substitua o domínio, o ramal e a senha pelos dados do seu servidor SIP.
             $sip = new SipUserAgent(
-                domain: 'sip.exemplo.com',
-                username: '1001',
-                password: 'sua-senha',
-                localIp: '0.0.0.0',
-                localPort: positiveSetting('SIP_LOCAL_PORT', '5060', 65535),
-                peerIp: '0.0.0.0',
-                peerPort: positiveSetting('SIP_PEER_PORT', '5060', 65535)
+                server: 'silva.spechshop.com',
+                username: 'ramal',
+                password: 'ramal'
             );
             $destination = '123';
             $seconds = positiveSetting('SIP_CALL_SECONDS', '10', 86400);
@@ -32,22 +79,15 @@ function main(): void
             $sip->start();
 
             // 3. Registrar o ramal. Uma falha no REGISTER lança uma exceção.
-            $registration = $sip->register(timeout: 5);
+            $registration = $sip->register();
             $registered = true;
             echo "Ramal registrado. {$registration->line}\n";
 
-            // 4. Oferecer áudio. A aplicação de mídia é responsável pela porta RTP.
-            $offer = new SdpSession(
-                address: requiredSetting('MEDIA_IP'),
-                port: positiveSetting('MEDIA_PORT', '', 65535),
-                payloads: [8, 0], // PCMA e PCMU
-                ptime: 20
-            );
+            // 4. Preparar a chamada. A porta UDP fica reservada, sem processamento RTP.
+            $call = $sip->createCall($destination);
+            echo "Porta reservada para mídia: " . $call->getLocalMediaPort() . "\n";
 
-            // 5. Criar a chamada usando o ramal registrado como origem.
-            $call = $sip->createCall(destination: $destination, offer: $offer);
-
-            // 6. Configurar os eventos antes do INVITE.
+            // 5. Configurar os eventos antes do INVITE.
             $call->onRinging(static function (SipCall $call, ?SipMessage $message, string $reason): void {
                 echo "Telefone tocando (180 Ringing).\n";
             });
@@ -59,7 +99,7 @@ function main(): void
             $call->onAnswer(static function (SipCall $call, ?SipMessage $message, string $reason) use ($seconds): void {
                 echo 'Chamada atendida. ' . $message?->line . "\n";
                 echo "Call-ID: {$call->id}\n";
-                $sdp = $call->remoteSdp();
+                $sdp = $call->getRemoteSdp();
                 if ($sdp !== null) {
                     echo "SDP remoto:\n" . $sdp->wire();
                     echo 'Payloads negociados: ' . implode(', ', $call->negotiatedPayloads()) . "\n";
@@ -77,18 +117,23 @@ function main(): void
 
             $call->onFailed(static function (SipCall $call, ?SipMessage $message, string $reason): void {
                 echo 'Falha na chamada: ' . ($message?->line ?? 'sem resposta SIP') . " ($reason)\n";
+                //var_dump($call);
             });
 
-            // 7. Enviar o INVITE.
+            // 6. Enviar o INVITE.
             echo "Chamando $destination. Call-ID: {$call->id}\n";
-            $call->invite();
+            try {
+                $call->invite();
+            } catch (Throwable $error) {
+                fwrite(STDERR, $error->getMessage() . "kkk \n");
+            }
 
-            // 8. Aguardar o encerramento local ou remoto.
+            // 7. Aguardar o encerramento local ou remoto.
             $call->waitForEnd();
         } catch (Throwable $error) {
-            fwrite(STDERR, $error->getMessage() . "\n");
+            fwrite(STDERR, $error->getMessage() . "kkk \n");
         } finally {
-            // 9. Remover o registro e liberar o transporte.
+            // 8. Remover o registro e liberar o transporte.
             try {
                 if ($registered) {
                     $sip->unregister();
@@ -100,15 +145,6 @@ function main(): void
             }
         }
     });
-}
-
-function requiredSetting(string $key): string
-{
-    $value = getenv($key);
-    if ($value === false || $value === '') {
-        throw new RuntimeException('Defina ' . $key);
-    }
-    return $value;
 }
 
 function positiveSetting(string $key, string $fallback, int $maximum): int

@@ -7,7 +7,9 @@ use Closure;
 use LogicException;
 use RuntimeException;
 use Throwable;
+use SpechMedia\Net\UdpEndpoint;
 use SpechMedia\Sdp\SdpSession;
+use Swoole\Coroutine\Socket;
 use Swoole\Coroutine;
 use Swoole\Coroutine\Channel;
 
@@ -34,16 +36,31 @@ final class SipCall
     private bool $dispatching = false;
     private Channel $end;
 
-    public function __construct(private SipUserAgent $ua, private string $uri, private SdpSession $offer)
+    public function __construct(private SipUserAgent $ua, private string $uri, private SdpSession $offer,
+        private ?Socket $mediaSocket = null, private ?UdpEndpoint $mediaBind = null)
     {
         $this->id = $ua->newId();
         $this->tag = SipUserAgent::tag();
         $this->end = new Channel(1);
     }
 
+    private function __clone() {}
+
+    public function __destruct()
+    {
+        $this->mediaSocket?->close();
+    }
+
     public function state(): string { return $this->state; }
     public function reason(): string { return $this->reason; }
     public function remoteSdp(): ?SdpSession { return $this->remote; }
+
+    public function getLocalSdp(): SdpSession { return $this->offer; }
+    public function getRemoteSdp(): ?SdpSession { return $this->remote; }
+    public function getLocalMediaIp(): string { return $this->offer->address; }
+    public function getLocalMediaPort(): int { return $this->offer->port; }
+    public function getMediaBindIp(): ?string { return $this->mediaBind?->ip; }
+    public function getMediaBindPort(): ?int { return $this->mediaBind?->port; }
 
     public function negotiatedPayloads(): array
     {
@@ -206,7 +223,10 @@ final class SipCall
             } elseif ($this->earlyTag !== $remoteTag || $this->remote === null) {
                 throw new RuntimeException('Missing SDP answer');
             }
-            if (!$this->remote->acceptsDirection($this->offer)) {
+            // A reserved inactive endpoint never processes RTP. Keep the signaling
+            // dialog even if the peer ignores inactive or omits its direction.
+            $signalingOnly = $this->mediaSocket !== null && $this->offer->direction === 'inactive';
+            if (!$signalingOnly && !$this->remote->acceptsDirection($this->offer)) {
                 throw new RuntimeException('Incompatible SDP answer direction');
             }
             if (!$this->negotiatedPayloads()) {
@@ -310,7 +330,10 @@ final class SipCall
         if (!$this->terminal()) {
             $this->reason = $reason;
             $this->state = $failed ? 'failed' : 'ended';
-            $this->ua->release($this->id);
+            $this->mediaSocket?->close();
+            $this->mediaSocket = null;
+            $this->mediaBind = null;
+            $this->ua->release($this);
             $this->emit($failed ? 'failed' : 'hangup', $msg, $reason);
             $this->end->close();
         }

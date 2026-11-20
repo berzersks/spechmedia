@@ -1,7 +1,8 @@
 <?php
 declare(strict_types=1);
 
-// Interpreter-only regression tests. No network sockets, no external registrar.
+// SIP messages stay in memory. UDP endpoint checks only bind/connect on loopback.
+use SpechMedia\Net\UdpEndpoint;
 use SpechMedia\Sdp\SdpSession;
 use SpechMedia\Sip\SipCall;
 use SpechMedia\Sip\SipMessage;
@@ -29,10 +30,11 @@ final class MemoryTransport implements SipTransport
     private Channel $in;
     private Channel $out;
 
-    public function open(): void
+    public function open(string $localIp, int $localPort, UdpEndpoint $server): UdpEndpoint
     {
         $this->in = new Channel(32);
         $this->out = new Channel(32);
+        return new UdpEndpoint('127.0.0.1', 45060);
     }
 
     public function send(string $data): void { $this->out->push($data); }
@@ -67,6 +69,8 @@ function checkRegistration(SipUserAgent $ua, MemoryTransport $wire): void
         $done->push($ua->register()->status());
     });
     $first = $wire->take('REGISTER');
+    check($first->header('contact') === '<sip:alice@192.0.2.10:5080>' && str_starts_with($first->header('via'),
+        'SIP/2.0/UDP 192.0.2.10:5080;'), 'REGISTER uses advertised SIP endpoint');
     $challenge = 'Digest realm="pbx", nonce="nonce", qop="auth", algorithm=SHA-256';
     $wire->inject(reply($first, 407, [['Proxy-Authenticate', $challenge]]));
     $second = $wire->take('REGISTER');
@@ -90,10 +94,78 @@ function checkRegistration(SipUserAgent $ua, MemoryTransport $wire): void
     check($done->pop(1) === 200, 'UNREGISTER result');
 }
 
+function checkEndpoints(): void
+{
+    $ua = new SipUserAgent(server: 'localhost', username: 'alice', password: 'fixture', serverPort: 5072);
+    check($ua->getLocalIp() === null && $ua->getServerIp() === null && $ua->getLocalPort() === null, 'Idle getters');
+    $ua->start();
+    try {
+        check($ua->getServerIp() === '127.0.0.1' && $ua->getServerPort() === 5072, 'Hostname and server port');
+        check($ua->getLocalIp() === '127.0.0.1' && $ua->getLocalPort() > 0, 'Route and ephemeral port');
+        check($ua->getAdvertisedPort() === $ua->getLocalPort(), 'Advertised ephemeral port');
+        // Inspect generated headers without sending a request to the UDP peer.
+        $packet = $ua->request('REGISTER', 'sip:localhost:5072', 'test', 'tag', '<sip:alice@localhost>', 1);
+        $sentBy = $ua->getLocalIp() . ':' . $ua->getLocalPort();
+        check($packet->header('contact') === "<sip:alice@$sentBy>" &&
+            str_starts_with($packet->header('via'), "SIP/2.0/UDP $sentBy;"), 'Actual ephemeral SIP port in headers');
+        $first = $ua->createCall('100');
+        $port = $first->getLocalMediaPort();
+        $second = $ua->createCall('200', mediaIp: '192.0.2.4', advertisedMediaPort: 50000, codecs: ['PCMU'], ptime: 30);
+        check($port !== $second->getMediaBindPort() && $port !== $ua->getLocalPort(), 'Independent bound sockets');
+        check($second->getLocalMediaIp() === '192.0.2.4' && $second->getLocalMediaPort() === 50000
+            && $second->getMediaBindIp() === '127.0.0.1' && $second->getLocalSdp()->ptime === 30
+            && $second->getLocalSdp()->payloads === [0], 'Media bind and advertised overrides');
+        check($first->getLocalSdp()->direction === 'inactive' && $first->getLocalSdp()->ptime === 20
+            && $first->getLocalSdp()->payloads === [8, 0] && $first->getRemoteSdp() === null, 'Default SDP');
+        try {
+            $ua->createCall('300', mediaPort: $port);
+            throw new LogicException('Duplicate port reservation');
+        } catch (RuntimeException $expected) {
+            check(str_contains($expected->getMessage(), 'bind'), 'Port is held while prepared');
+        }
+        $first->hangup();
+        try {
+            $ua->createCall('400', mediaPort: $port, ptime: 0);
+            throw new LogicException('Accepted invalid ptime');
+        } catch (InvalidArgumentException $expected) {
+            // Offer creation failed after bind. The next call must be able to reserve the same port.
+        }
+        $draft = $ua->createCall('400', mediaPort: $port);
+        unset($draft);
+        $reused = $ua->createCall('500', mediaPort: $port);
+        check($reused->getMediaBindPort() === $port, 'Discarded draft releases socket');
+    } finally {
+        $ua->stop();
+    }
+    check($ua->getLocalPort() === null && $second->getMediaBindPort() === null
+        && $reused->state() === 'failed', 'Stop releases pending calls');
+    $probe = UdpEndpoint::bind('127.0.0.1', $port);
+    $probe->close();
+
+    $fixed = new SipUserAgent('127.0.0.1', 'alice', 'fixture', localIp: '127.0.0.1', localPort: $port,
+        advertisedIp: '192.0.2.10', advertisedPort: 5080);
+    $fixed->start();
+    try {
+        check($fixed->getLocalPort() === $port && $fixed->getAdvertisedPort() === 5080
+            && $fixed->getAdvertisedIp() === '192.0.2.10', 'Fixed SIP bind independent of announced address');
+        $draft = $fixed->createCall('100');
+        check($draft->getLocalMediaIp() === '127.0.0.1', 'SIP override does not change SDP');
+    } finally {
+        $fixed->stop();
+    }
+    try {
+        (new SipUserAgent('0.0.0.0', 'alice', 'fixture'))->start();
+        throw new LogicException('Accepted unspecified server');
+    } catch (InvalidArgumentException $expected) {
+        check(str_contains($expected->getMessage(), 'IPv4'), 'Unspecified peer fails clearly');
+    }
+}
+
 Coroutine::set(['hook_flags' => 0]);
 Swoole\Coroutine\run(static function (): void {
+    checkEndpoints();
     $wire = new MemoryTransport();
-    $ua = new SipUserAgent('192.0.2.1', 5060, 'pbx.test', 'alice', 'fixture', '192.0.2.2', transport: $wire, t1: 0.1);
+    $ua = new SipUserAgent('127.0.0.1', 'alice', 'fixture', domain: 'pbx.test', advertisedIp: '192.0.2.10', advertisedPort: 5080, transport: $wire, t1: 0.1);
     $ua->start();
     try {
         checkRegistration($ua, $wire);
@@ -101,11 +173,14 @@ Swoole\Coroutine\run(static function (): void {
         $answer = new SdpSession('192.0.2.2', 4321, [8], 30, 'recvonly');
         $fields = [['contact', '<sip:target@pbx.test>'], ['record-route', '<sip:r1;lr>, <sip:r2;lr>'], ['content-type', 'application/sdp']];
         $a = $ua->createCall('100', $offer);
-        $b = $ua->createCall('200', $offer);
+        $b = $ua->createCall('200');
+        $bPort = $b->getLocalMediaPort();
         $a->invite();
         $b->invite();
+        check($a->getLocalSdp() === $offer && $a->getMediaBindPort() === null, 'External offer owns its socket');
         $ia = $wire->take('INVITE');
         $ib = $wire->take('INVITE');
+        check($ib->body === $b->getLocalSdp()->wire() && $b->getMediaBindPort() === $bPort, 'INVITE sends reserved SDP');
         $a->hangup();
         $wire->inject(reply($ia, 100));
         $cancel = $wire->take('CANCEL');
@@ -119,6 +194,8 @@ Swoole\Coroutine\run(static function (): void {
             check($ack->branch() === $ib->branch() && $ack->header('to') === $busy->header('to'), 'Negative ACK');
         }
         check($b->waitForEnd(1) && $b->state() === 'failed', 'Busy call');
+        $probe = UdpEndpoint::bind('127.0.0.1', $bPort);
+        $probe->close();
         $ok = reply($ia, 200, $fields, $answer->wire());
         $wire->inject($ok);
         $ack = $wire->take('ACK');
@@ -189,6 +266,52 @@ Swoole\Coroutine\run(static function (): void {
         $wire->inject(reply($retry, 401, $challenge));
         $wire->take('ACK');
         check($rejected->waitForEnd(1) && $rejected->state() === 'failed', 'Bounded authentication attempts');
+
+        $automatic = $ua->createCall('450');
+        $automatic->invite();
+        $out = $wire->take('INVITE');
+        $silentAnswer = new SdpSession('192.0.2.2', 4321, [8], 20, 'inactive');
+        $wire->inject(reply($out, 200, $fields, $silentAnswer->wire()));
+        $wire->take('ACK');
+        check($automatic->state() === 'answered' && $automatic->getRemoteSdp()?->direction === 'inactive',
+            'Inactive offer and answer establish the dialog');
+        $automatic->hangup();
+        $localBye = $wire->take('BYE');
+        check($automatic->getMediaBindPort() !== null, 'BYE awaiting final retains reservation');
+        $wire->inject(reply($localBye, 200));
+        check($automatic->waitForEnd(1) && $automatic->getMediaBindPort() === null,
+            'Successful hangup releases media endpoint');
+
+        // Some providers answer inactive offers with sendrecv (also the default when omitted).
+        $activeAnswer = new SdpSession('192.0.2.2', 4321, [8], 20, 'sendrecv');
+        foreach ([true, false] as $explicitDirection) {
+            $body = $explicitDirection ? $activeAnswer->wire() : str_replace("a=sendrecv\r\n", '', $activeAnswer->wire());
+            $call = $ua->createCall('451');
+            $answered = new Channel(1);
+            $call->onAnswer(static function (SipCall $call, ?SipMessage $message, string $reason) use ($answered): void {
+                $answered->push($call->state());
+            });
+            $call->invite();
+            $out = $wire->take('INVITE');
+            $wire->inject(reply($out, 180));
+            $wire->inject(reply($out, 183, $fields, $body));
+            $wire->inject(reply($out, 200, $fields, $explicitDirection ? $body : ''));
+            $wire->take('ACK');
+            check($answered->pop(1) === 'answered', 'Signaling-only call survives remote direction mismatch');
+            check($call->getLocalSdp()->direction === 'inactive' && $call->getRemoteSdp()?->wire() === $body,
+                'Local media remains inactive and original answer is observable');
+            $call->hangup();
+            $wire->inject(reply($wire->take('BYE'), 200));
+            check($call->waitForEnd(1) && $call->state() === 'ended', 'Application controls hangup');
+        }
+
+        $strict = $ua->createCall('452', new SdpSession('192.0.2.1', 1234, [8], 20, 'inactive'));
+        $strict->invite();
+        $out = $wire->take('INVITE');
+        $wire->inject(reply($out, 200, $fields, $activeAnswer->wire()));
+        $wire->take('ACK');
+        $wire->inject(reply($wire->take('BYE'), 200));
+        check($strict->waitForEnd(1) && $strict->state() === 'failed', 'Explicit offers retain direction validation');
 
         $timeout = new Channel(1);
         Coroutine::create(static function () use ($ua, $timeout): void {

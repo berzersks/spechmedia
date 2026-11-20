@@ -4,22 +4,28 @@ declare(strict_types=1);
 namespace SpechMedia\Sip;
 
 use RuntimeException;
+use SpechMedia\Net\UdpEndpoint;
+use Throwable;
 use Swoole\Coroutine\Socket;
 
 final class UdpTransport implements SipTransport
 {
     private ?Socket $socket = null;
 
-    public function __construct(private string $localIp, private int $localPort, private string $peerIp, private int $peerPort) {}
-
-    public function open(): void
+    public function open(string $localIp, int $localPort, UdpEndpoint $server): UdpEndpoint
     {
-        $socket = new Socket(AF_INET, SOCK_DGRAM, 0);
-        if (!$socket->bind($this->localIp, $this->localPort) || !$socket->connect($this->peerIp, $this->peerPort)) {
+        $socket = UdpEndpoint::bind($localIp, $localPort);
+        try {
+            if (!$socket->connect($server->ip, $server->port)) {
+                throw new RuntimeException("Cannot connect UDP transport to {$server->ip}:{$server->port}");
+            }
+            $local = UdpEndpoint::local($socket);
+            $this->socket = $socket;
+            return $local;
+        } catch (Throwable $error) {
             $socket->close();
-            throw new RuntimeException('UDP bind/connect failed');
+            throw $error;
         }
-        $this->socket = $socket;
     }
 
     public function send(string $data): void
