@@ -1,0 +1,6 @@
+name: example
+build-mode: bin
+php-version: '8.5'
+sources:
+  - example.php
+  - src

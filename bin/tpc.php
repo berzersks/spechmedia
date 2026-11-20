@@ -31,6 +31,12 @@ esac
 mkdir -p "$ROOT/.toolchain/home" "$ROOT/.toolchain/build"
 
 # Options must precede '--', which delimits the compiled application's arguments.
+# The SIP example is a multi-source TypePHP project. Preserve all user flags.
+if [[ -f "$1" && "$1" -ef "$ROOT/example.php" ]]; then
+  shift
+  set -- /workspace/example.yml "$@"
+fi
+
 compiler_args=()
 program_args=()
 after_delimiter=0
