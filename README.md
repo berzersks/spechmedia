@@ -1,84 +1,71 @@
 # SpechMedia
 
-Biblioteca e motor de telefonia VoIP em PHP com compilação AOT via [TypePHP](https://github.com/swoole/typephp).
+Biblioteca e futuro motor de telefonia VoIP em PHP, compilada com [TypePHP](https://github.com/swoole/typephp) (AOT) e Swoole.
 
-> **Rascunho inicial**: este repositório contém somente a toolchain isolada e um Hello World. Ainda não implementa SIP, SDP, RTP ou codecs G.711. O Swoole passa a integrar o runtime privado de teste, mas sua execução ainda precisa ser validada.
+> Rascunho inicial: toolchain isolada, Hello World e exemplo de servidor Swoole. SIP, SDP, RTP e G.711 ainda não estão implementados.
 
-## Início rápido (Linux AMD64 / ARM64)
+## Início rápido — Linux AMD64 / ARM64
 
-Requisito no computador: **Docker** funcionando e acesso ao daemon (`docker info`). Nenhum PHP, Composer ou extensão precisa ser instalado no host.
+Requisito no host: Docker instalado e funcionando (`docker info`). Não é necessário instalar PHP ou Composer no computador.
 
-### 1. Preparar o ambiente de compilação
-
-Na raiz do SpechMedia:
+### 1. Preparar a toolchain
 
 ```bash
 ./scripts/setup-toolchain.sh
 ```
 
-O comando constrói a imagem local `spechmedia-toolchain:0.10.1` usando PHP 8.5, Composer 2, TypePHP 0.10.1 e dependências de compilação. O ambiente permanece dentro do Docker.
+Esse comando monta a imagem local `spechmedia-toolchain:0.10.1` com PHP 8.5, Composer e TypePHP 0.10.1, sem modificar o PHP do sistema.
 
-### 2. Compilar o Hello World com TypePHP
+### 2. Compilar o Hello World
 
 ```bash
-./scripts/build-hello.sh
+bin/tpc.php hello.php
 ```
 
-O comando executa o TypePHP no container e produz `bin/hello` na máquina local. Usa `--php-builder` para construir um runtime PHP privado com Swoole e POSIX, sem utilizar a biblioteca PHP do host. **A primeira compilação pode demorar**, pois compila também o runtime privado.
-
-### 3. Executar o programa compilado
+### 3. Executar
 
 ```bash
+./hello
+```
+
+Saída esperada: `Hello World from SpechMedia!`
+
+O exemplo mínimo está em [hello.php](hello.php).
+
+## Outros comandos
+
+```bash
+bin/tpc.php hello.php -O3
+bin/tpc.php hello.php -o meu-programa
+
+# Exemplo existente de servidor TCP Swoole
+bin/tpc.php examples/hello.php -o swoole-server
+./swoole-server
+
+# Atalho antigo, mantido para compatibilidade
+./scripts/build-hello.sh
 ./bin/hello
 ```
 
-Saída esperada em uma compilação concluída com sucesso:
+`bin/tpc.php` é um **launcher Bash executável** e não depende de `php` no host. Invoque-o diretamente (não use `php bin/tpc.php`). O compilador aceita opções usuais do TypePHP e deve ser executado dentro do projeto. O servidor de exemplo usa processos/workers; não exige `SWOOLE_THREAD`.
 
-```text
-Hello World from SpechMedia!
-```
+## Toolchain e correção do Swoole
 
-O código-fonte está em [`examples/hello.php`](examples/hello.php):
-
-```php
-<?php
-
-function main(): void
-{
-    echo "Hello World from SpechMedia!\n";
-}
-```
-
-## Qual comando TypePHP o script executa?
-
-Dentro do container, `scripts/build-hello.sh` chama:
+O launcher usa Docker e configura automaticamente:
 
 ```bash
-php /opt/typephp/vendor/bin/tpc.php examples/hello.php \
-  --php-builder='extensions: [swoole, posix]; zts: off' \
-  --build-dir /workspace/.toolchain/build \
-  -o bin/hello
+--php-builder='extensions: [swoole, posix]; zts: off' \
+--build-dir /workspace/.toolchain/build
 ```
 
-O binário resultante é gerado por TypePHP a partir de PHP, e não pelo interpretador do host. O `--php-builder` é intencional: evita depender de `libphp.so` presente no computador. O Swoole é incluído explicitamente no runtime privado para testar posteriormente a integração AOT. `--build-dir` coloca os arquivos C++ gerados em uma pasta gravável, evitando o erro de permissão em `/opt/typephp/vendor/swoole/typephp/build`.
+O `scripts/prepare-swoole-source.py` registra os arquivos C++ principais do Swoole no `config.m4` **do cache privado** antes de o TypePHP gerar o PHP estático. Isso contorna o problema diagnosticado em que 126 fontes existiam, mas nenhum objeto principal era registrado no Makefile, resultando em `undefined reference to swoole_module_entry`. O script também corrige as árvores de fontes já preparadas e regenera o `configure` correspondente. Não edita o PHP do host nem o repositório oficial do Swoole.
 
-## Isolamento do ambiente
+A primeira compilação com Swoole pode precisar construir o PHP privado; compilações seguintes reutilizam os caches em `.toolchain/home` e `.toolchain/build`.
 
-- Não altera `/usr/bin/php`, `/usr/local/bin/php` ou as alternativas do sistema.
-- Não utiliza o pcg729 da libspech/SipSwoole.
-- Não executa `apt install` no computador; as dependências são instaladas **somente na imagem Docker**.
-- Mantém o cache de compilação em `.toolchain/home`, ignorado pelo Git.
-- A imagem Docker é própria do projeto; o código e a saída da compilação ficam no diretório local.
-- `--php-builder` cria o runtime privado, mas **não significa que o binário final será totalmente estático**. A ligação e as dependências efetivas ainda precisam ser inspecionadas.
+**Isolamento:** não altera `/usr/bin/php`, `update-alternatives` nem o pcg729/libspech/SipSwoole. A imagem Docker instala suas próprias dependências. O executável AOT não é necessariamente totalmente estático; confirme com `file hello` e `ldd hello`.
 
-## Estado do projeto
+## Estado de validação
 
-O objetivo desta primeira etapa é validar apenas o caminho completo: instalar toolchain isolada, compilar PHP com TypePHP e executar o binário nativo. **O Hello World sem Swoole já foi compilado e executado com sucesso no ambiente local. A variante com Swoole ainda não foi validada após esta alteração.**
+Já foi comprovada a compilação AOT de um Hello World e observada a inicialização dos workers Swoole após a correção manual no cache. O **novo launcher e a automação** passaram por verificações locais de sintaxe, argumentos e idempotência do patch, mas ainda precisam de validação end-to-end em uma instalação Docker limpa. A recepção UDP e o processamento RTP não foram testados.
 
-Próximos experimentos: confirmar integração de Swoole com sockets UDP no AOT, criar parser RTP e introduzir decodificação/gravação G.711 PCMA/PCMU. A configuração do `php-builder` já solicita Swoole explicitamente, mas é necessário confirmar a compilação, a presença da classe `Swoole\Server` no executável e o funcionamento real de sockets UDP.
-
-### Fontes técnicas
-
-- [TypePHP README](https://github.com/swoole/typephp)
-- [PHP builder do TypePHP](https://github.com/swoole/typephp/blob/master/docs/en/LIBPHP_INSTALLER.md)
-- [Versões do pacote TypePHP](https://packagist.org/packages/swoole/typephp)
+Referências: [TypePHP](https://github.com/swoole/typephp) · [PHP builder](https://github.com/swoole/typephp/blob/master/docs/en/LIBPHP_INSTALLER.md).

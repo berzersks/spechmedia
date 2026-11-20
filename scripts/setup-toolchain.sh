@@ -15,4 +15,4 @@ fi
 
 printf 'Preparando toolchain privada: %s\n' "$IMAGE"
 docker build -f "$ROOT/Dockerfile.toolchain" -t "$IMAGE" "$ROOT"
-printf 'Toolchain Docker preparada. Proximo passo: ./scripts/build-hello.sh\n'
+printf 'Toolchain preparada. Compile com: bin/tpc.php hello.php\n'

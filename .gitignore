@@ -1,4 +1,6 @@
 .toolchain/
-bin/hello
-build/
+/hello
+/swoole-server
+/bin/hello
+/build/
 .idea

@@ -1,7 +1,7 @@
 <?php
 function getpid($serv)
 {
-    return $serv->mode === SWOOLE_THREAD ? \Swoole\Thread::getId() : posix_getpid();
+    return posix_getpid();
 }
 
 function main()

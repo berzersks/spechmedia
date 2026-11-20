@@ -8,7 +8,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       autoconf bison build-essential ca-certificates cmake curl git \
       libgmp-dev libmpfr-dev libonig-dev libssl-dev libxml2-dev \
-      pkg-config re2c unzip zlib1g-dev \
+      pkg-config python3 re2c unzip zlib1g-dev \
  && docker-php-ext-install -j"$(nproc)" mbstring gmp \
  && rm -rf /var/lib/apt/lists/*
 
@@ -18,5 +18,7 @@ RUN mkdir -p /opt/typephp \
  && cd /opt/typephp \
  && composer require --no-interaction --no-progress --prefer-dist "swoole/typephp:${TYPEPHP_VERSION}" \
  && php vendor/bin/tpc.php --help >/dev/null
+
+COPY scripts/prepare-swoole-source.py /opt/spechmedia/prepare-swoole-source.py
 
 WORKDIR /workspace
