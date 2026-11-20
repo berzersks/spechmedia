@@ -1,6 +1,7 @@
 <?php
 declare(strict_types=1);
 
+use SpechMedia\Media\AlawPlayback;
 use SpechMedia\Sip\SipCall;
 use SpechMedia\Sip\SipMessage;
 use SpechMedia\Sip\SipUserAgent;
@@ -9,8 +10,13 @@ use Swoole\Coroutine;
 function main(): void
 {
     Coroutine::set(['hook_flags' => 0]);
+    include '/home/lotus/projetos/libspech/plugins/autoloader.php';
 
-    Co\run(static function (): void {
+
+    $wav = getenv('SIP_AUDIO_FILE') ?: '/home/lotus/Músicas/ARANHA_48k_mono.wav';
+    $alaw = AlawPlayback::loadWav($wav);
+
+    Co\run(static function () use ($alaw): void {
         $sip = null;
         $registered = false;
 
@@ -18,7 +24,7 @@ function main(): void
         $prevStat = null;
 
        go(function (){
-         for ($ix = 0; $ix < 30; $ix++) {
+         for ($ix = 0; $ix < 60; $ix++) {
              // Lê apenas a primeira linha do /proc/stat (total de todas as CPUs)
              $handle = fopen('/proc/stat', 'r');
              if (!$handle) {
@@ -60,7 +66,6 @@ function main(): void
 
              echo sprintf("$ix - Uso de CPU: %.2f%%\n", $cpuUsage);
             Coroutine::sleep(1);
-            echo microtime(true).PHP_EOL;
 
          }
        });
@@ -73,7 +78,7 @@ function main(): void
                 password: 'ramal'
             );
             $destination = '123';
-            $seconds = positiveSetting('SIP_CALL_SECONDS', '10', 86400);
+            $seconds = positiveSetting('SIP_CALL_SECONDS', '60', 86400);
 
             // 2. Iniciar o transporte UDP.
             $sip->start();
@@ -84,9 +89,9 @@ function main(): void
             echo "Ramal registrado. {$registration->line}\n";
 
             // 4. Preparar a chamada e habilitar a gravação do áudio remoto.
-            $call = $sip->createCall($destination);
-            // Aceitar sendrecv de PBXs que ignoram recvonly na resposta.
-            $call->enableAudioRecording(allowSendrecvAnswer: true);
+            $call = $sip->createCall($destination, codecs: ['PCMA'], ptime: 20);
+            $call->enableAudioRecording();
+            $call->enableAudioPlayback($alaw);
             echo "Porta reservada para mídia: " . $call->getLocalMediaPort() . "\n";
 
             // 5. Configurar os eventos antes do INVITE.

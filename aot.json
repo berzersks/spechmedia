@@ -1,0 +1,68 @@
+{
+  "nome": "aot",
+  "pid": 108773,
+  "janela_s": 10,
+  "rss_inicial_mib": 23.53125,
+  "amostras": [
+    {
+      "wall_s": 1.000373516,
+      "user_s": 0.0,
+      "system_s": 0.01,
+      "rss_mib": 23.53125
+    },
+    {
+      "wall_s": 0.999864599,
+      "user_s": 0.01,
+      "system_s": 0.0,
+      "rss_mib": 23.53125
+    },
+    {
+      "wall_s": 1.000010719,
+      "user_s": 0.0,
+      "system_s": 0.0,
+      "rss_mib": 23.53125
+    },
+    {
+      "wall_s": 1.000001756,
+      "user_s": 0.01,
+      "system_s": 0.0,
+      "rss_mib": 23.53125
+    },
+    {
+      "wall_s": 1.000093892,
+      "user_s": 0.0,
+      "system_s": 0.0,
+      "rss_mib": 23.53125
+    },
+    {
+      "wall_s": 0.999998008,
+      "user_s": 0.01,
+      "system_s": 0.01,
+      "rss_mib": 23.53125
+    },
+    {
+      "wall_s": 0.999999282,
+      "user_s": 0.0,
+      "system_s": 0.0,
+      "rss_mib": 23.53125
+    },
+    {
+      "wall_s": 0.999996192,
+      "user_s": 0.0,
+      "system_s": 0.0,
+      "rss_mib": 23.53125
+    },
+    {
+      "wall_s": 0.99997632,
+      "user_s": 0.01,
+      "system_s": 0.01,
+      "rss_mib": 23.53125
+    },
+    {
+      "wall_s": 1.000060897,
+      "user_s": 0.0,
+      "system_s": 0.0,
+      "rss_mib": 23.53125
+    }
+  ]
+}

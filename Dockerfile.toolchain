@@ -1,5 +1,6 @@
 # Isolated PHP/TypePHP compiler, never installs PHP on the host.
-FROM php:8.5-cli-bookworm
+ARG PHP_VARIANT=cli
+FROM php:8.5-${PHP_VARIANT}-bookworm
 
 ARG TYPEPHP_VERSION=0.10.1
 ENV COMPOSER_ALLOW_SUPERUSER=1
@@ -20,5 +21,11 @@ RUN mkdir -p /opt/typephp \
  && php vendor/bin/tpc.php --help >/dev/null
 
 COPY scripts/prepare-swoole-source.py /opt/spechmedia/prepare-swoole-source.py
+
+COPY scripts/install-audio-extensions.sh scripts/install-toolchain-extensions.sh scripts/toolchain-options.sh scripts/typephp-extensions.patch /opt/spechmedia/
+
+ARG EXTRA_EXTENSIONS=""
+RUN bash /opt/spechmedia/install-toolchain-extensions.sh $EXTRA_EXTENSIONS
+LABEL spechmedia.extensions="$EXTRA_EXTENSIONS"
 
 WORKDIR /workspace

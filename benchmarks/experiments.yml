@@ -1,0 +1,6 @@
+name: spechmedia_experiments
+build-mode: bin
+php-version: '8.5'
+sources:
+  - experiments.php
+  - ../src

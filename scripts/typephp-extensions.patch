@@ -1,0 +1,21 @@
+--- a/src/Build/PeclExtensionSource.php
++++ b/src/Build/PeclExtensionSource.php
+@@ -33,6 +33,12 @@
+             throw new \InvalidArgumentException("Invalid PECL extension name `{$extension}`");
+         }
+ 
++        $extension = str_replace('-', '_', $extension);
++        $source = '/opt/spechmedia/extensions/' . $extension;
++        if (is_file($source . '/.spechmedia-revision')) {
++            return ['directory' => $source, 'version' => trim(file_get_contents($source . '/.spechmedia-revision'))];
++        }
++
+         $version = trim($this->downloader->downloadText(
+             'https://pecl.php.net/rest/r/' . rawurlencode($extension) . '/stable.txt',
+         ));
+--- a/src/Build/SapiExtensionConfiguration.php
++++ b/src/Build/SapiExtensionConfiguration.php
+@@ -79,1 +79,2 @@
+-        return array_values(array_unique($options));
++        $extra = file('/opt/spechmedia/configure-options', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
++        return array_values(array_unique([...$options, ...$extra]));

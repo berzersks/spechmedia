@@ -96,6 +96,38 @@ $buffer = new AudioBuffer(4);
 $buffer->append(packet(1, $pcmu, 0));
 check($buffer->bytes() === 4 && $buffer->truncated() && $buffer->pcm() === pack('v*', 0, 0), 'Partial packet at the byte limit');
 
+$alphabet = implode('', array_map('chr', range(0, 255)));
+foreach ([8 => 'e04788d110e58ff8c70c93b8480190d973e3b67876b6119abbaec766cc75c174',
+    0 => '3dab54339e520bb2c924826e3b72a917a2b612e9fd12fc867500f1d983a75827'] as $pt => $reference) {
+    check(hash('sha256', G711Decoder::decode($alphabet, $pt)) === $reference, 'All 256 reference samples');
+    check(G711Decoder::decode($alphabet, $pt, -1) === '', 'Negative sample limit');
+}
+
+// Compare the live datagram path with the public packet API, including pending
+// packets drained by an in-order arrival and the change of SSRC on renegotiation.
+$fast = new AudioBuffer(33000);
+$reference = new AudioBuffer(33000);
+$live = new RtpReceiver($fast);
+$object = new RtpReceiver($reference);
+foreach ([0xfedcba98, 0x12345678] as $ssrc) {
+    foreach ([65534, 65533, 0, 65535, 1, 3, 4, 2, 3, 9, 30, 27, 31, 32] as $seq) {
+        $wire = pack('CCnNN', 128, 136, $seq, $seq * 160, $ssrc) . str_repeat(chr($seq & 255), 720);
+        $wires = [$wire, substr($wire, 0, 11), substr_replace($wire, pack('N', 1), 8, 4),
+            "\xb0" . substr($wire, 1, 11) . pack('nn', 1, 1) . 'abcd' . substr($wire, 12) . "\x01"];
+        foreach ($wires as $data) {
+            $live->receiveDatagram($data);
+            $parsed = RtpPacket::parse($data, 8000);
+            if ($parsed !== null) {
+                $object->receive($parsed);
+            }
+            check($fast->pcm() === $reference->pcm(), 'Datagram and packet paths agree');
+        }
+    }
+    $live->finishStream();
+    $object->finishStream();
+}
+check($fast->truncated() && $fast->pcm() === $reference->pcm(), 'Truncated multi-block recording');
+
 $file = tempnam(sys_get_temp_dir(), 'spechmedia-');
 unlink($file);
 try {
@@ -110,6 +142,8 @@ try {
     check(unpack('V', $wav, 4)[1] === strlen($wav) - 8 && unpack('V', $wav, 40)[1] === strlen($expected)
         && substr($wav, 44) === $expected, 'WAV sizes and audio bytes');
     check(!WavWriter::write($file, '') && file_get_contents($file) === $wav, 'Empty export leaves an existing WAV intact');
+    check($fast->writeWav($file) && file_get_contents($file, false, null, 44) === $fast->pcm(),
+        'Segmented export contains the exact truncated PCM');
 } finally {
     if (file_exists($file)) {
         unlink($file);

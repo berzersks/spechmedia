@@ -10,7 +10,16 @@ final class WavWriter
 {
     public static function write(string $filename, string $pcm): bool
     {
-        $bytes = strlen($pcm);
+        return self::writeBlocks($filename, [], $pcm);
+    }
+
+    /** @internal The arguments form a copy-on-write snapshot if I/O yields. */
+    public static function writeBlocks(string $filename, array $blocks, string $tail): bool
+    {
+        $bytes = strlen($tail);
+        foreach ($blocks as $block) {
+            $bytes += strlen($block);
+        }
         if ($bytes === 0) {
             return false;
         }
@@ -28,7 +37,15 @@ final class WavWriter
         }
         try {
             self::writeAll($file, $header);
-            self::writeAll($file, $pcm);
+            foreach ($blocks as $block) {
+                self::writeAll($file, $block);
+            }
+            if ($tail !== '') {
+                self::writeAll($file, $tail);
+            }
+            if (!fflush($file)) {
+                throw new RuntimeException('Cannot flush WAV file');
+            }
         } finally {
             fclose($file);
         }

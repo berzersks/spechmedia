@@ -13,7 +13,7 @@ if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
   printf 'Erro: Docker indisponivel ou sem permissao de acesso.\n' >&2
   exit 1
 fi
-if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+if ! extras=$(docker image inspect --format '{{with .Config.Labels}}{{index . "spechmedia.extensions"}}{{end}}' "$IMAGE" 2>/dev/null); then
   printf 'Erro: toolchain nao preparada. Execute ./scripts/setup-toolchain.sh primeiro.\n' >&2
   exit 1
 fi
@@ -53,8 +53,12 @@ for arg in "$@"; do
 done
 
 # Explicit settings preserve the private PHP + Swoole runtime and writable build cache.
+source "$ROOT/scripts/toolchain-options.sh"
+read -ra selected <<< "$extras"
+resolve_toolchain_options "${selected[@]}"
+extensions=$(IFS=,; echo "${runtime[*]}")
 compiler_args+=(
-  '--php-builder=extensions: [swoole, posix]; zts: off'
+  "--php-builder=extensions: [$extensions]; zts: $zts"
   '--build-dir' '/workspace/.toolchain/build'
 )
 if (( after_delimiter )); then
@@ -63,9 +67,14 @@ fi
 
 exec docker run --rm \
   --user "$(id -u):$(id -g)" \
+  --env "SPECHMEDIA_EXTENSIONS=$extras" \
   --env HOME=/workspace/.toolchain/home \
   --volume "$ROOT:/workspace" \
   --workdir "$WORKDIR" \
   "$IMAGE" \
-  bash -c 'set -e; python3 /opt/spechmedia/prepare-swoole-source.py; exec php /opt/typephp/vendor/bin/tpc.php "$@"' \
+  bash -c 'set -e
+    if [[ " $SPECHMEDIA_EXTENSIONS " != *" swow "* ]]; then
+      python3 /opt/spechmedia/prepare-swoole-source.py
+    fi
+    exec php /opt/typephp/vendor/bin/tpc.php "$@"' \
   spechmedia-tpc "${compiler_args[@]}"

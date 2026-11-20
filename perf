@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+for cmd in fzf perf ps awk grep; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "Dependência ausente: $cmd"
+        exit 1
+    fi
+done
+
+mkdir -p perf-out
+
+selected=$(
+    ps aux | fzf \
+        --header-lines=1 \
+        --height=100% \
+        --border \
+        --reverse \
+        --prompt="Selecionar processo > " \
+        --header="↑ ↓ Navegar | Enter Selecionar | ESC Cancelar | Digite para pesquisar"
+) || exit 0
+
+[[ -n "$selected" ]] || exit 0
+
+pid=$(awk '{print $2}' <<< "$selected")
+cpu=$(awk '{print $3}' <<< "$selected")
+
+if ! ps -p "$pid" >/dev/null 2>&1; then
+    echo "O processo PID $pid já foi encerrado."
+    exit 1
+fi
+
+name=$(ps -p "$pid" -o comm= | tr -cs '[:alnum:]_.-' '_')
+name=${name%_}
+sec=
+echo
+read -r -p "Tempo de coleta em segundos [$sec]: " sec < /dev/tty
+sec=${sec:-10}
+
+if ! [[ "$sec" =~ ^[0-9]+$ ]] || (( 10#$sec == 0 )); then
+    echo "Duração inválida."
+    exit 1
+fi
+
+sec=$((10#$sec))
+
+echo
+read -r -p "Identificador do teste [native/traditional]: " label < /dev/tty
+label=${label:-unknown}
+label=$(printf '%s' "$label" | tr -cs '[:alnum:]_.-' '_')
+label=${label%_}
+
+stamp=$(date +%Y%m%d-%H%M%S)
+prefix="perf-out/${label}-${name}-${pid}-${stamp}"
+
+data="${prefix}.data"
+flat="${prefix}-flat.txt"
+children="${prefix}-children.txt"
+stats="${prefix}-stat.txt"
+
+echo
+echo "========================================"
+echo " Processo: $name"
+echo " PID: $pid"
+echo " CPU informado pelo ps: $cpu%"
+echo " Duração: ${sec}s"
+echo " Modo: $label"
+echo "========================================"
+echo
+
+# Coleta eventos de hardware quando disponíveis.
+events="task-clock,context-switches,cpu-migrations,page-faults"
+
+if perf stat -e cycles,instructions -- true >/dev/null 2>&1; then
+    events="${events},cycles,instructions"
+fi
+
+echo "[1/4] Iniciando contadores de CPU..."
+
+perf stat \
+    --no-big-num \
+    -p "$pid" \
+    -e "$events" \
+    -o "$stats" \
+    -- sleep "$sec" &
+
+stat_pid=$!
+
+echo "[2/4] Coletando amostras e call stacks..."
+
+if ! perf record \
+    -e cpu-clock \
+    -F 999 \
+    --call-graph fp \
+    -p "$pid" \
+    -o "$data" \
+    -- sleep "$sec"; then
+
+    echo "Falha no perf record."
+    kill "$stat_pid" 2>/dev/null || true
+    wait "$stat_pid" 2>/dev/null || true
+    exit 1
+fi
+
+if ! wait "$stat_pid"; then
+    echo "Falha no perf stat."
+    exit 1
+fi
+
+echo "[3/4] Gerando relatório flat..."
+
+perf report \
+    -i "$data" \
+    --stdio \
+    --no-children \
+    --sort=symbol \
+    > "$flat"
+
+echo "[4/4] Gerando relatório com custos acumulados..."
+
+perf report \
+    -i "$data" \
+    --stdio \
+    --children \
+    --sort=symbol \
+    > "$children"
+
+echo
+echo "========================================"
+echo " RESUMO DE CPU"
+echo "========================================"
+
+grep -E \
+    'task-clock|cycles|instructions|context-switches|cpu-migrations|page-faults|seconds time elapsed' \
+    "$stats" || cat "$stats"
+
+echo
+echo "========================================"
+echo " RESUMO DO PROFILING"
+echo "========================================"
+
+grep -E \
+    'Total Lost Samples|Samples:|Event count' \
+    "$flat" | head -10 || true
+
+echo
+echo "========================================"
+echo " ARQUIVOS GERADOS"
+echo "========================================"
+
+ls -lh "$data" "$flat" "$children" "$stats"
+
+echo
+echo "Coleta concluída."

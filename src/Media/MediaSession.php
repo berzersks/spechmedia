@@ -5,7 +5,6 @@ namespace SpechMedia\Media;
 
 use InvalidArgumentException;
 use LogicException;
-use ReflectionMethod;
 use RuntimeException;
 use SpechMedia\Net\UdpEndpoint;
 use SpechMedia\Sdp\SdpSession;
@@ -43,13 +42,12 @@ final class MediaSession
         $cid = Coroutine::create(function () use ($socket): void {
             try {
                 $burst = 0;
-                $checkpoint = hrtime(true);
+                $checkpoint = \hrtime(true);
                 $peer = null;
-                // TypePHP needs the reference in the argument array for this extension method.
-                $read = new ReflectionMethod(Socket::class, 'recvfrom');
+                // TypePHP 0.10.1 loses the peer reference on a direct extension-method call.
                 $args = [&$peer, -1.0];
                 while ($this->socket !== null) {
-                    $datagram = $read->invokeArgs($socket, $args);
+                    $datagram = $socket->recvfrom(...$args);
                     if ($datagram === false || $this->socket === null) {
                         break;
                     }
@@ -59,7 +57,7 @@ final class MediaSession
                     unset($datagram);
                     if (++$burst >= 32) {
                         $burst = 0;
-                        $now = hrtime(true);
+                        $now = \hrtime(true);
                         if ($now - $checkpoint < 10_000_000) {
                             // A continuously readable socket must yield to signaling.
                             Coroutine::sleep(0.001);
@@ -78,8 +76,8 @@ final class MediaSession
 
     public function applyAnswer(SdpSession $offer, SdpSession $answer, bool $newStream = false): void
     {
-        if ($offer->direction !== 'recvonly' || $offer->port === 0) {
-            throw new InvalidArgumentException('RTP reception requires a recvonly offer with an audio port');
+        if ($offer->direction === 'inactive' || $offer->port === 0) {
+            throw new InvalidArgumentException('RTP requires an active offer with an audio port');
         }
         if ($answer->port === 0) {
             throw new InvalidArgumentException('Peer rejected the audio stream (SDP port 0)');
@@ -89,16 +87,18 @@ final class MediaSession
             throw new InvalidArgumentException('No common G.711 payload in SDP answer (remote PTs: '
                 . implode(', ', $answer->payloads) . ')');
         }
-        $compatibleSendrecv = $this->allowSendrecvAnswer && $answer->direction === 'sendrecv';
+        $compatibleSendrecv = $this->allowSendrecvAnswer && $offer->direction === 'recvonly' && $answer->direction === 'sendrecv';
         if (!$answer->acceptsDirection($offer) && !$compatibleSendrecv) {
-            throw new InvalidArgumentException('Incompatible SDP answer direction for recvonly offer: ' . $answer->direction);
+            throw new InvalidArgumentException('Incompatible SDP answer direction for ' . $offer->direction . ' offer: ' . $answer->direction);
         }
         $source = null;
         if ($answer->direction !== 'inactive') {
             if (!UdpEndpoint::isUnicast($answer->address)) {
                 throw new InvalidArgumentException('Invalid remote SDP audio address: ' . $answer->address);
             }
-            $source = new UdpEndpoint($answer->address, $answer->port);
+            if ($offer->direction !== 'sendonly' && $answer->direction !== 'recvonly') {
+                $source = new UdpEndpoint($answer->address, $answer->port);
+            }
         }
         $allowed = $source === null ? [] : array_fill_keys($payloads, true);
         if ($newStream || $source != $this->source || $allowed != $this->payloads) {
@@ -113,6 +113,14 @@ final class MediaSession
             }
         }
         $this->beforeAnswer = [];
+    }
+
+    public function startPlayback(AlawPlayback $playback, SdpSession $answer): void
+    {
+        if ($this->socket !== null && ($answer->direction === 'recvonly' || $answer->direction === 'sendrecv')
+            && in_array(8, $answer->payloads, true)) {
+            $playback->start($this->socket, new UdpEndpoint($answer->address, $answer->port), $answer->ptime);
+        }
     }
 
     public function resetNegotiation(bool $awaitingAnswer): void
@@ -131,30 +139,34 @@ final class MediaSession
 
     private function receive(string $datagram, string $ip, int $port): void
     {
-        if (!$this->awaitingAnswer && !$this->matchesSource($ip, $port)) {
+        if (!$this->awaitingAnswer) {
+            if ($this->matchesSource($ip, $port) && \strlen($datagram) >= 12
+                && isset($this->payloads[\ord($datagram[1]) & 127])) {
+                $this->receiver?->receiveDatagram($datagram);
+            }
             return;
         }
         $packet = RtpPacket::parse($datagram, G711Decoder::SAMPLE_RATE);
         if ($packet === null) {
             return;
         }
-        if ($this->awaitingAnswer) {
-            // RTP can win the race against SIP. Keep only a small pre-answer queue and
-            // validate its source and payload against the SDP before decoding anything.
-            if ($packet->payloadType !== G711Decoder::PCMA && $packet->payloadType !== G711Decoder::PCMU) {
-                return;
-            }
-            if (count($this->beforeAnswer) >= self::BEFORE_SDP_PACKETS) {
-                array_shift($this->beforeAnswer);
-            }
-            $this->beforeAnswer[] = [$ip, $port, $packet];
-        } elseif (isset($this->payloads[$packet->payloadType])) {
-            $this->receiver?->receive($packet);
+        // RTP can win the race against SIP. Keep only a small pre-answer queue and
+        // validate its source and payload against the SDP before decoding anything.
+        if ($packet->payloadType !== G711Decoder::PCMA && $packet->payloadType !== G711Decoder::PCMU) {
+            return;
         }
+        if (\count($this->beforeAnswer) >= self::BEFORE_SDP_PACKETS) {
+            array_shift($this->beforeAnswer);
+        }
+        $this->beforeAnswer[] = [$ip, $port, $packet];
     }
 
     public function bound(): ?UdpEndpoint { return $this->bound; }
     public function pcm(): string { return $this->buffer?->pcm() ?? ''; }
+    public function saveRecordingToWavFile(string $filename): bool
+    {
+        return $this->buffer?->writeWav($filename) ?? false;
+    }
     public function recordedBytes(): int { return $this->buffer?->bytes() ?? 0; }
     public function recordingTruncated(): bool { return $this->buffer?->truncated() ?? false; }
 

@@ -1,0 +1,68 @@
+{
+  "nome": "pcg",
+  "pid": 109223,
+  "janela_s": 10,
+  "rss_inicial_mib": 55.96875,
+  "amostras": [
+    {
+      "wall_s": 1.000307982,
+      "user_s": 0.03,
+      "system_s": 0.01,
+      "rss_mib": 55.96875
+    },
+    {
+      "wall_s": 0.999940111,
+      "user_s": 0.02,
+      "system_s": 0.01,
+      "rss_mib": 55.96875
+    },
+    {
+      "wall_s": 0.999950529,
+      "user_s": 0.03,
+      "system_s": 0.0,
+      "rss_mib": 55.96875
+    },
+    {
+      "wall_s": 1.000051993,
+      "user_s": 0.03,
+      "system_s": 0.01,
+      "rss_mib": 55.96875
+    },
+    {
+      "wall_s": 0.999983437,
+      "user_s": 0.03,
+      "system_s": 0.01,
+      "rss_mib": 55.96875
+    },
+    {
+      "wall_s": 1.000162947,
+      "user_s": 0.03,
+      "system_s": 0.01,
+      "rss_mib": 55.96875
+    },
+    {
+      "wall_s": 0.999882781,
+      "user_s": 0.03,
+      "system_s": 0.0,
+      "rss_mib": 56.09375
+    },
+    {
+      "wall_s": 0.999952832,
+      "user_s": 0.03,
+      "system_s": 0.01,
+      "rss_mib": 56.09375
+    },
+    {
+      "wall_s": 1.00000668,
+      "user_s": 0.02,
+      "system_s": 0.0,
+      "rss_mib": 56.09375
+    },
+    {
+      "wall_s": 1.000007319,
+      "user_s": 0.02,
+      "system_s": 0.01,
+      "rss_mib": 56.96875
+    }
+  ]
+}

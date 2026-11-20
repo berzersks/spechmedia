@@ -1,0 +1,6 @@
+name: spechmedia_perf
+build-mode: bin
+php-version: '8.5'
+sources:
+  - media.php
+  - ../src

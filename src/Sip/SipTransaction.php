@@ -31,6 +31,8 @@ final class SipTransaction
         $this->deadline = $now + min($timeout, 64 * $t1);
     }
 
+    public function packet(): string { return $this->packet; }
+
     public function cancelling(float $now): void
     {
         if ($this->invite && !$this->completed) {

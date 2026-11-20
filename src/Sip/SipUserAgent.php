@@ -44,8 +44,12 @@ final class SipUserAgent
         private string $localIp = '0.0.0.0', private int $localPort = 0,
         private ?string $advertisedIp = null, private ?int $advertisedPort = null,
         ?string $domain = null, ?SipTransport $transport = null, private float $t1 = 0.5,
-        private float $progressTimeout = 180.0, private bool $log = false
+        private float $progressTimeout = 180.0, private bool $log = false,
+        private int $maxCalls = 64, private int $maxTransactions = 512
     ) {
+        if ($maxCalls < 1 || $maxTransactions < 1) {
+            throw new InvalidArgumentException('Expected positive SIP capacity limits');
+        }
         $this->domain = $domain ?? ($serverPort === 5060 ? $server : "$server:$serverPort");
         if (!preg_match('/^[a-zA-Z0-9.-]+$/D', $server)
             || ($localIp !== '0.0.0.0' && !UdpEndpoint::isUnicast($localIp))
@@ -310,8 +314,8 @@ final class SipUserAgent
             }
             return new SipCall($this, $uri, $offer);
         }
-        if (!$this->running || $this->local === null || count($this->prepared) + count($this->calls) >= 64) {
-            throw new RuntimeException('Start the UA before preparing a call; at most 64 calls may hold endpoints');
+        if (!$this->running || $this->local === null || count($this->prepared) + count($this->calls) >= $this->maxCalls) {
+            throw new RuntimeException("Start the UA before preparing a call; at most {$this->maxCalls} calls may hold endpoints");
         }
         $bindIp = $mediaBindIp ?? $this->local->ip;
         $address = $mediaIp ?? $bindIp;
@@ -342,7 +346,7 @@ final class SipUserAgent
     /** @internal */
     public function attach(SipCall $call): void
     {
-        if (!$this->running || (!isset($this->prepared[$call]) && count($this->prepared) + count($this->calls) >= 64)) {
+        if (!$this->running || (!isset($this->prepared[$call]) && count($this->prepared) + count($this->calls) >= $this->maxCalls)) {
             throw new RuntimeException('UA stopped or call limit reached');
         }
         unset($this->prepared[$call]);
@@ -394,18 +398,22 @@ final class SipUserAgent
     /** @internal */
     public function transact(SipMessage $request, Closure $notify, float $timeout = 3600.0): void
     {
-        if (!$this->running || count($this->transactions) >= 512) {
+        if (!$this->running || count($this->transactions) >= $this->maxTransactions) {
             throw new RuntimeException('UA stopped or transaction limit reached');
         }
         $key = $request->branch() . ' ' . $request->method();
-        $this->transactions[$key] = new SipTransaction($request, $notify, hrtime(true) / 1e9,
+        $tx = new SipTransaction($request, $notify, hrtime(true) / 1e9,
             $this->t1, $this->progressTimeout, $timeout);
+        $this->transactions[$key] = $tx;
         try {
             if ($request->method() === 'CANCEL') {
                 $invite = $this->transactions[$request->branch() . ' INVITE'] ?? null;
                 $invite?->cancelling(hrtime(true) / 1e9);
             }
-            $this->sendMessage($request);
+            if ($this->log) {
+                $this->trace('send ' . $request->method() . ' ' . $request->status());
+            }
+            $this->sendPacket($tx->packet());
         } catch (Throwable $e) {
             unset($this->transactions[$key]);
             throw $e;

@@ -8,6 +8,7 @@ use LogicException;
 use ReflectionFunction;
 use RuntimeException;
 use Throwable;
+use SpechMedia\Media\AlawPlayback;
 use SpechMedia\Media\AudioBuffer;
 use SpechMedia\Media\MediaSession;
 use SpechMedia\Media\WavWriter;
@@ -42,6 +43,7 @@ final class SipCall
     private Channel $end;
     private ?MediaSession $media;
     private bool $recording = false;
+    private ?AlawPlayback $playback = null;
 
     public function __construct(private SipUserAgent $ua, private string $uri, private SdpSession $offer,
         ?Socket $mediaSocket = null, ?UdpEndpoint $mediaBind = null)
@@ -56,6 +58,7 @@ final class SipCall
 
     public function __destruct()
     {
+        $this->playback?->stop();
         $this->media?->close();
     }
 
@@ -78,9 +81,27 @@ final class SipCall
         $this->media->enableRecording($maxBytes, $allowSendrecvAnswer);
         if (!$this->recording) {
             $offer = $this->offer;
-            $this->offer = new SdpSession($offer->address, $offer->port, $offer->payloads, $offer->ptime, 'recvonly');
+            $this->offer = new SdpSession($offer->address, $offer->port, $offer->payloads, $offer->ptime,
+                $this->playback === null ? 'recvonly' : 'sendrecv');
             $this->recording = true;
         }
+    }
+
+    /** Loop pre-encoded PCMA mono at 8 kHz after the final SDP answer. */
+    public function enableAudioPlayback(string $alaw): void
+    {
+        if ($this->state !== 'new' || $this->media === null || !in_array(8, $this->offer->payloads, true)) {
+            throw new LogicException('Enable PCMA playback before INVITE on a call with a local PCMA endpoint');
+        }
+        $this->playback = new AlawPlayback($alaw);
+        $offer = $this->offer;
+        $this->offer = new SdpSession($offer->address, $offer->port, [8], $offer->ptime,
+            $this->recording ? 'sendrecv' : 'sendonly');
+    }
+
+    private function managesMedia(): bool
+    {
+        return $this->recording || $this->playback !== null;
     }
 
     public function getBuffer(): string { return $this->media?->pcm() ?? ''; }
@@ -90,6 +111,11 @@ final class SipCall
     public function saveBufferToWavFile(string $filename, string $buffer): bool
     {
         return WavWriter::write($filename, $buffer);
+    }
+
+    public function saveRecordingToWavFile(string $filename): bool
+    {
+        return $this->media?->saveRecordingToWavFile($filename) ?? false;
     }
 
     public function negotiatedPayloads(): array
@@ -155,7 +181,7 @@ final class SipCall
         $fields = array_merge([['Content-Type', 'application/sdp']], $this->ua->credentials($this->auth, 'INVITE', $this->uri));
         $request = $this->ua->request('INVITE', $this->uri, $this->id, $this->tag, '<' . $this->uri . '>',
             ++$this->seq, $fields, $this->offer->wire());
-        if ($this->recording && $this->inviteRequest !== null) {
+        if ($this->managesMedia() && $this->inviteRequest !== null) {
             $this->media->resetNegotiation(true);
         }
         $this->inviteRequest = $request;
@@ -188,7 +214,7 @@ final class SipCall
             }
             if ($status === 180 || $status === 183) {
                 $this->state = $this->cancelWanted ? 'cancelling' : 'proceeding';
-                if ($msg->body !== '' && (!$this->recording || !$this->cancelWanted)) {
+                if ($msg->body !== '' && (!$this->managesMedia() || !$this->cancelWanted)) {
                     $this->provisionalSdp($msg);
                 }
                 $this->emit($status === 180 ? 'ringing' : 'progress', $msg);
@@ -219,18 +245,18 @@ final class SipCall
     private function provisionalSdp(SipMessage $msg): void
     {
         $tag = SipMessage::parameter($msg->header('to'), 'tag');
-        if ($this->recording && ($tag === '' || ($this->earlyTag !== '' && $this->earlyTag !== $tag))) {
+        if ($this->managesMedia() && ($tag === '' || ($this->earlyTag !== '' && $this->earlyTag !== $tag))) {
             return;
         }
         try {
             $remote = $this->readSdp($msg);
-            if ($this->recording) {
+            if ($this->managesMedia()) {
                 $this->media->applyAnswer($this->offer, $remote);
             }
             $this->remote = $remote;
             $this->earlyTag = $tag;
         } catch (\InvalidArgumentException $e) {
-            if (!$this->recording) {
+            if (!$this->managesMedia()) {
                 $this->remote = null;
             }
         }
@@ -273,7 +299,7 @@ final class SipCall
             } catch (\InvalidArgumentException | RuntimeException $e) {
                 $this->reason = $e->getMessage();
                 $this->rejectedAnswer = $msg;
-                if ($this->recording) {
+                if ($this->managesMedia()) {
                     $this->media->resetNegotiation(false);
                 }
             }
@@ -282,6 +308,19 @@ final class SipCall
         if ($this->cancelWanted || $this->reason !== '') {
             $this->hangup();
             return;
+        }
+        if ($this->state !== 'answered') {
+            return;
+        }
+        if ($this->playback !== null) {
+            try {
+                $this->media->startPlayback($this->playback, $this->remote);
+            } catch (RuntimeException $e) {
+                $this->reason = $e->getMessage();
+                $this->rejectedAnswer = $msg;
+                $this->hangup();
+                return;
+            }
         }
         $this->emit('answer', $msg);
     }
@@ -293,7 +332,7 @@ final class SipCall
         } elseif ($this->earlyTag !== $remoteTag || $this->remote === null) {
             throw new RuntimeException('Missing SDP answer');
         }
-        if ($this->recording) {
+        if ($this->managesMedia()) {
             $newStream = $this->earlyTag !== '' && $this->earlyTag !== $remoteTag;
             $this->media->applyAnswer($this->offer, $this->remote, $newStream);
             return;
@@ -329,6 +368,7 @@ final class SipCall
         try {
             if ($this->dialog !== null) {
                 $this->state = 'ending';
+                $this->playback?->stop();
                 $this->sendBye($this->dialog, [], true);
             } else {
                 $this->cancelWanted = true;
@@ -399,6 +439,8 @@ final class SipCall
             $this->reason = $reason;
             $this->state = $failed ? 'failed' : 'ended';
             $this->rejectedAnswer = null;
+            $this->playback?->stop();
+            $this->playback = null;
             $this->media?->close();
             $this->ua->release($this);
             $this->emit($failed ? 'failed' : 'hangup', $msg, $reason);

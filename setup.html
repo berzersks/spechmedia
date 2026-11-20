@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Gerador de setup · SpechMedia</title>
+  <style>
+    * { box-sizing: border-box }
+    :root { font-family: Inter, system-ui, sans-serif; color: #172e2a; background: #f5f7f5; }
+    body { margin: 0; }
+    header { background: #112f2a; color: white; padding: 1.15rem max(5vw, calc((100vw - 1120px)/2)); display: flex; align-items: center; gap: .8rem; }
+    .brand { font-size: 1.15rem; font-weight: 750; letter-spacing: -.04em }
+    .wave { display: inline-flex; gap: 3px; align-items: center; height: 2rem; }
+    .wave i { width: 4px; border-radius: 3px; background: #a5efb4; height: 10px; }
+    .wave i:nth-child(2), .wave i:nth-child(4) { height: 21px }
+    .wave i:nth-child(3) { height: 30px }
+    main { width: min(90%, 1120px); margin: clamp(2rem, 5vw, 4rem) auto; }
+    h1 { font-size: clamp(2.4rem, 5vw, 4.25rem); letter-spacing: -.065em; line-height: 1.03; margin: 0; }
+    .intro { color: #52645e; line-height: 1.6; margin: .85rem 0 2rem; }
+    .layout { display: grid; grid-template-columns: 1.5fr 1fr; align-items: start; gap: 1.5rem; }
+    .panel, aside { border-radius: 16px; padding: clamp(1.25rem, 3vw, 1.85rem); }
+    .panel { background: white; border: 1px solid #d6dfd9; }
+    h2 { font-size: 1.35rem; margin: 0; letter-spacing: -.04em; }
+    .base { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem; margin: 1rem 0 1.4rem; color: #52645e; font-size: .9rem; }
+    .chip { font: .85rem ui-monospace, monospace; color: #285b44; background: #eaf4eb; border-radius: 5px; padding: .25rem .45rem; }
+    fieldset { padding: 0; border: 0; margin: 0; min-width: 0; }
+    fieldset + fieldset { margin-top: 1.4rem; }
+    legend { font-weight: 650; padding: 0; margin-bottom: .7rem; }
+    .choices { display: grid; grid-template-columns: 1fr 1fr; gap: .65rem; }
+    label { display: grid; grid-template-columns: 1.1rem 1fr; gap: .65rem; align-items: start; padding: .9rem; border: 1px solid #d6dfd9; border-radius: 8px; cursor: pointer; }
+    label:has(input:disabled) { opacity: .55; cursor: default; }
+    label:hover, label:has(input:checked) { background: #f0f8f1; border-color: #608f70; }
+    input { width: 1.05rem; height: 1.05rem; accent-color: #216b48; margin: .1rem 0 0; }
+    code, textarea { font-family: ui-monospace, Consolas, monospace; }
+    label code { font-weight: 650; }
+    small { display: block; line-height: 1.4; font-size: .875rem; color: #5c6964; margin-top: .25rem; }
+    aside { background: #183c34; color: #fff; }
+    aside p { font-size: .95rem; color: #d4e5db; line-height: 1.55; margin: .7rem 0 1.4rem; }
+    .console { padding: 1rem; background: #0e2722; border: 1px solid #3e5e53; border-radius: 9px; }
+    .console span { color: #a7c8b6; font: .85rem ui-monospace, monospace; }
+    textarea { display: block; margin-top: .8rem; width: 100%; resize: vertical; border: 0; background: transparent; color: #c4f5ca; font-size: 1rem; line-height: 1.55; }
+    button { width: 100%; font: inherit; font-weight: 650; border: 0; border-radius: 8px; padding: .85rem; margin-top: 1rem; background: #b2eebe; color: #143c27; cursor: pointer; }
+    button:hover { background: #c7f7cf; }
+    :focus-visible { outline: 3px solid #4da5df; outline-offset: 3px; }
+    #status { display: block; font-size: .875rem; margin-top: .65rem; }
+    #status:empty { margin: 0; }
+    @media(min-width: 801px) { aside { position: sticky; top: 1.5rem; } }
+    @media(max-width: 800px) { .layout { grid-template-columns: 1fr; } }
+    @media(max-width: 480px) { .choices { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <header><span class="wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span><span class="brand">SpechMedia</span></header>
+  <main>
+    <h1>Gerador de setup</h1>
+    <p class="intro">Escolha as extensões PHP que deseja incluir na toolchain do SpechMedia.</p>
+    <div class="layout">
+      <section class="panel" aria-labelledby="extensions-title">
+        <h2 id="extensions-title">Extensões PHP</h2>
+        <p class="base">Base da compilação <code class="chip" id="base-runtime">swoole</code><code class="chip">posix</code></p>
+        <div id="choices"></div>
+        <noscript>Ative o JavaScript para selecionar as extensões e gerar o comando.</noscript>
+      </section>
+      <aside aria-labelledby="result-title">
+        <h2 id="result-title">Comando de setup</h2>
+        <p>Execute na raiz do repositório com o Docker em funcionamento.</p>
+        <div class="console"><span>Bash</span>
+          <textarea id="command" aria-label="Comando gerado" rows="3" readonly spellcheck="false">./scripts/setup-toolchain.sh</textarea>
+        </div>
+        <button type="button" id="copy">Copiar comando</button>
+        <span id="status" role="status"></span>
+      </aside>
+    </div>
+  </main>
+  <script>
+    const groups = {
+      'Áudio e mídia': 'bcg729 psampler opus gd glfw imagick',
+      'Concorrência e sistema': 'swoole-hook-mysql swoole-hook-pgsql swoole-hook-sqlite swow parallel pcntl sockets sysvmsg sysvsem sysvshm shmop event inotify uv dio ffi ftp',
+      'Bancos de dados': 'dba ldap mongodb mysqli mysqlnd oci8 odbc pdo pdo_mysql pdo_odbc pdo_pgsql pdo_sqlite pdo_sqlsrv pgsql sqlite3 sqlsrv',
+      'Cache e mensageria': 'amqp apcu igbinary memcache memcached msgpack rdkafka redis yac',
+      'Texto e documentos': 'ctype dom enchant exif fileinfo gettext iconv intl libxml mbregex mbstring simdjson simplexml soap tidy tokenizer xlswriter xml xmlreader xmlwriter xsl yaml',
+      'Compactação e arquivos': 'bz2 phar rar snappy zip zlib zstd',
+      'Rede e segurança': 'curl gmssl grpc imap mcrypt openssl password-argon2 protobuf sodium ssh2',
+      'Linguagem e diagnóstico': 'ast bcmath calendar ds filter gmp opcache opentelemetry readline session spx uuid xdebug xhprof',
+    };
+    const descriptions = {
+      bcg729: 'Codificação e decodificação de áudio G.729',
+      psampler: 'Processamento de amostras de áudio PCM',
+      opus: 'Codificação e decodificação de áudio Opus',
+      sockets: 'Comunicação de rede',
+      pcntl: 'Controle de processos',
+      bcmath: 'Cálculos decimais precisos',
+      gmp: 'Aritmética de inteiros grandes',
+      mbstring: 'Texto multibyte',
+      dom: 'Manipulação de XML e HTML',
+      exif: 'Metadados de fotografias',
+      zlib: 'Compressão de dados',
+      'swoole-hook-mysql': 'Acesso ao MySQL em corrotinas',
+      'swoole-hook-pgsql': 'Acesso ao PostgreSQL em corrotinas',
+      'swoole-hook-sqlite': 'Acesso ao SQLite em corrotinas',
+      mbregex: 'Expressões regulares multibyte com mbstring',
+      'password-argon2': 'Hash de senhas com Argon2',
+      swow: 'Substitui o Swoole nesta compilação',
+      parallel: 'Usa PHP com suporte a threads (ZTS)',
+      xdebug: 'Depurador do PHP CLI da imagem',
+    };
+    const choices = document.getElementById('choices');
+    const command = document.getElementById('command');
+    const status = document.getElementById('status');
+    for (const [group, names] of Object.entries(groups)) {
+      const fieldset = document.createElement('fieldset');
+      const legend = document.createElement('legend');
+      legend.textContent = group;
+      const grid = document.createElement('div');
+      grid.className = 'choices';
+      for (const name of names.split(' ')) {
+        const label = document.createElement('label');
+        const description = descriptions[name];
+        label.innerHTML = `<input type="checkbox" value="${name}"><span><code>${name}</code>${description ? `<small>${description}</small>` : ''}</span>`;
+        grid.append(label);
+      }
+      fieldset.append(legend, grid);
+      choices.append(fieldset);
+    }
+    function updateCommand() {
+      const swow = choices.querySelector('[value="swow"]').checked;
+      document.getElementById('base-runtime').textContent = swow ? 'swow' : 'swoole';
+      for (const hook of choices.querySelectorAll('[value^="swoole-hook-"]')) {
+        hook.disabled = swow;
+      }
+      const selected = Array.from(choices.querySelectorAll(':checked:enabled'), input => input.value);
+      command.value = ['./scripts/setup-toolchain.sh', ...selected].join(' ');
+      status.textContent = '';
+    }
+    choices.addEventListener('change', updateCommand);
+    window.addEventListener('pageshow', updateCommand);
+    document.getElementById('copy').addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(command.value);
+        status.textContent = 'Comando copiado.';
+      } catch {
+        command.focus();
+        command.select();
+        status.textContent = 'Comando selecionado. Use a opção Copiar do seu navegador.';
+      }
+    });
+  </script>
+</body>
+</html>

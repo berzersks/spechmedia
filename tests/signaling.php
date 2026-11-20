@@ -176,6 +176,69 @@ function expectAudio(SipCall $call, string $expected): void
     check($call->getBuffer() === $expected, 'Expected negotiated PCM in call ' . $call->id);
 }
 
+function checkPlayback(): void
+{
+    $wire = new MemoryTransport();
+    $ua = new SipUserAgent('127.0.0.1', 'alice', 'fixture', transport: $wire);
+    $ua->start();
+    $rtp = UdpEndpoint::bind('127.0.0.1', 0);
+    $peer = UdpEndpoint::local($rtp);
+    $file = tempnam(sys_get_temp_dir(), 'playback');
+    try {
+        \SpechMedia\Media\WavWriter::write($file, pack('v*', 0, 8, 24));
+        $audio = \SpechMedia\Media\AlawPlayback::loadWav($file);
+        check($audio === "\xd5\xd5\xd4", 'WAV encoded to PCMA');
+        $fields = [['contact', '<sip:peer@pbx.test>'], ['content-type', 'application/sdp']];
+        foreach (['sendrecv', 'recvonly', 'sendonly', 'inactive'] as $direction) {
+            $call = $ua->createCall('600');
+            $call->enableAudioRecording();
+            $call->enableAudioPlayback($audio);
+            $call->invite();
+            $invite = $wire->take('INVITE');
+            $offer = SdpSession::parse($invite->body);
+            check($offer->direction === 'sendrecv' && $offer->payloads === [8], 'Duplex PCMA offer');
+            $answer = new SdpSession($peer->ip, $peer->port, [8], 10, $direction);
+            $wire->inject(reply($invite, 183, $fields, $answer->wire()));
+            $from = null;
+            $args = [&$from, 0.025];
+            check($rtp->recvfrom(...$args) === false, 'No playback before final answer');
+            $wire->inject(reply($invite, 200, $fields, $answer->wire()));
+            $wire->take('ACK');
+            if ($direction === 'sendrecv' || $direction === 'recvonly') {
+                $data = $rtp->recvfrom(...$args);
+                check(is_string($data) && ord($data[1]) === 136 && $from['port'] === $offer->port,
+                    'First PCMA packet carries marker from offered port');
+                $first = \SpechMedia\Media\RtpPacket::parse($data);
+                check($first->payload === substr(str_repeat($audio, 27), 0, 80), 'Looped 10 ms PCMA frame');
+                $second = \SpechMedia\Media\RtpPacket::parse($rtp->recvfrom(...$args));
+                check($second->sequence === (($first->sequence + 1) & 65535) && $second->ssrc === $first->ssrc
+                    && $second->timestamp === (($first->timestamp + 80) & 0xffffffff)
+                    && $second->payload === substr(str_repeat($audio, 54), 80, 80), 'Continuous RTP clock and audio');
+            } else {
+                check($rtp->recvfrom(...$args) === false, 'Remote SDP disallows playback');
+            }
+            sendRtp($rtp, $call, 1, 8, "\xd5");
+            sendRtp($rtp, $call, 2, 8, "\xd4");
+            if ($direction === 'sendrecv' || $direction === 'sendonly') {
+                expectAudio($call, pack('v*', 8, 24));
+            } else {
+                Coroutine::sleep(0.005);
+                check($call->getBuffer() === '', 'Receive only negotiated input');
+            }
+            $call->hangup();
+            $wire->inject(reply($wire->take('BYE'), 200));
+            check($call->waitForEnd(1.0), 'Playback call closed');
+            // Discard frames queued before BYE, then check that the sender stays silent.
+            for ($i = 0; $i < 16 && $rtp->recvfrom(...$args) !== false; ++$i) {}
+            check($rtp->recvfrom(...$args) === false, 'Playback stopped after BYE');
+        }
+    } finally {
+        $ua->stop();
+        $rtp->close();
+        unlink($file);
+    }
+}
+
 function checkRecording(bool $legacyAnswer = false): void
 {
     $wire = new MemoryTransport();
@@ -253,6 +316,7 @@ function checkRecording(bool $legacyAnswer = false): void
         check($wire->take('BYE')->status() === 200 && $a->waitForEnd(1.0), 'Remote BYE completes');
         check($done->pop(1.0) === [$a->id, null, pack('v*', 8, -24, -8), false, true],
             'Remote hangup callback observes closed socket and retained PCM');
+        check($a->saveRecordingToWavFile($recording), 'Export recording directly from closed call');
         check(substr(file_get_contents($recording), 44) === $a->getBuffer(), 'Hangup WAV contains the exact received PCM');
         foreach ([$aPort, $bPort] as $port) {
             UdpEndpoint::bind('127.0.0.1', $port)->close();
@@ -322,9 +386,88 @@ function checkRecording(bool $legacyAnswer = false): void
     }
 }
 
+/** Optional scale check. All dialogs coexist before any BYE is sent. */
+function checkSimultaneousDialogs(int $count): void
+{
+    $wire = new MemoryTransport();
+    $ua = new SipUserAgent('127.0.0.1', 'alice', 'fixture', transport: $wire,
+        maxCalls: $count, maxTransactions: $count * 2);
+    $sender = UdpEndpoint::bind('127.0.0.1', 0);
+    $source = UdpEndpoint::local($sender);
+    $sdp = new SdpSession($source->ip, $source->port, [8], 20, 'sendonly');
+    $fields = [['contact', '<sip:peer@pbx.test>'], ['content-type', 'application/sdp']];
+    $ua->start();
+    try {
+        $calls = [];
+        for ($i = 0; $i < $count; ++$i) {
+            $call = $ua->createCall('600');
+            $call->enableAudioRecording(8);
+            $call->invite();
+            $wire->inject(reply($wire->take('INVITE'), 200, $fields, $sdp->wire()));
+            $wire->take('ACK');
+            $calls[] = $call;
+        }
+        foreach ($calls as $i => $call) {
+            $payload = pack('n', $i);
+            sendRtp($sender, $call, 65535, 8, $payload);
+            sendRtp($sender, $call, 0, 8, $payload);
+        }
+        foreach ($calls as $i => $call) {
+            $expected = \SpechMedia\Media\G711Decoder::decode(pack('nn', $i, $i), 8);
+            expectAudio($call, $expected);
+            $call->hangup();
+            $wire->inject(reply($wire->take('BYE'), 200));
+            check($call->waitForEnd(1.0) && $call->getMediaBindPort() === null, 'Release dialog and RTP socket');
+        }
+        echo "OK: $count simultaneous loopback dialogs\n";
+    } finally {
+        $ua->stop();
+        $sender->close();
+    }
+}
+
+function checkCapacity(): void
+{
+    $wire = new MemoryTransport();
+    $ua = new SipUserAgent('127.0.0.1', 'alice', 'fixture', transport: $wire, maxCalls: 65, maxTransactions: 1);
+    $ua->start();
+    try {
+        $drafts = [];
+        for ($i = 0; $i < 65; ++$i) {
+            $drafts[] = $ua->createCall('600');
+        }
+        $denied = false;
+        try {
+            $ua->createCall('601');
+        } catch (RuntimeException $e) {
+            $denied = true;
+        }
+        check($denied, 'Configured capacity counts prepared endpoints');
+        $drafts[0]->invite();
+        $wire->take('INVITE');
+        $denied = false;
+        try {
+            $drafts[1]->invite();
+        } catch (RuntimeException $e) {
+            $denied = true;
+        }
+        check($denied && $drafts[1]->state() === 'failed', 'Transaction limit releases failed call');
+        $replacement = $ua->createCall('602');
+        check($replacement->getMediaBindPort() !== null, 'Released capacity can be reused');
+    } finally {
+        $ua->stop();
+    }
+}
+
 Coroutine::set(['hook_flags' => 0]);
 Swoole\Coroutine\run(static function (): void {
+    $scale = (int) getenv('SPECHMEDIA_SCALE_TEST');
+    if ($scale > 0) {
+        checkSimultaneousDialogs($scale);
+    }
+    checkCapacity();
     checkEndpoints();
+    checkPlayback();
     checkRecording();
     checkRecording(true);
     $wire = new MemoryTransport();

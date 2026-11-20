@@ -16,7 +16,7 @@ final class AudioBuffer
     private string $tail = '';
     private int $bytes = 0;
     private bool $truncated = false;
-    private readonly int $maxBytes;
+    private int $maxBytes;
 
     public function __construct(int $maxBytes = self::DEFAULT_MAX_BYTES)
     {
@@ -28,19 +28,31 @@ final class AudioBuffer
 
     public function append(RtpPacket $packet): void
     {
-        $remaining = intdiv($this->maxBytes - $this->bytes, 2);
-        if (strlen($packet->payload) > $remaining) {
+        $this->appendPayload($packet->payload, $packet->payloadType, 0, \strlen($packet->payload));
+    }
+
+    /** @internal Append a validated slice without creating a payload string. */
+    public function appendPayload(string $data, int $payloadType, int $offset, int $length): void
+    {
+        $remaining = ($this->maxBytes - $this->bytes) >> 1;
+        if ($length > $remaining) {
             $this->truncated = true;
+            $length = $remaining;
         }
-        if ($remaining > 0) {
-            $pcm = G711Decoder::decode($packet->payload, $packet->payloadType, $remaining);
-            $this->bytes += strlen($pcm);
+        if ($length > 0) {
+            $pcm = G711Decoder::decodeRange($data, $payloadType, $offset, $length);
+            $this->bytes += 2 * $length;
             $this->tail .= $pcm;
-            if (strlen($this->tail) >= self::BLOCK_BYTES) {
+            if (\strlen($this->tail) >= self::BLOCK_BYTES) {
                 $this->blocks[] = $this->tail;
                 $this->tail = '';
             }
         }
+    }
+
+    public function writeWav(string $filename): bool
+    {
+        return WavWriter::writeBlocks($filename, $this->blocks, $this->tail);
     }
 
     public function pcm(): string
