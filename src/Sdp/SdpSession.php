@@ -83,9 +83,10 @@ final class SdpSession
                 $ptime = (int) $m[1];
             } elseif (in_array($line, ['a=sendrecv', 'a=inactive', 'a=sendonly', 'a=recvonly'], true)) {
                 $direction = substr($line, 2);
-            } elseif (preg_match('/^a=rtpmap:(0|8)\s+(.+)$/iD', $line, $m)) {
-                $codec = $m[1] === '8' ? 'PCMA' : 'PCMU';
-                if (!in_array(strtoupper($m[2]), [$codec . '/8000', $codec . '/8000/1'], true)) {
+            } elseif (preg_match('/^a=rtpmap:([0-9]+)(?:\s+(.*))?$/iD', $line, $m)
+                && in_array((int) $m[1], [0, 8], true)) {
+                $codec = (int) $m[1] === 8 ? 'PCMA' : 'PCMU';
+                if (!in_array(strtoupper($m[2] ?? ''), [$codec . '/8000', $codec . '/8000/1'], true)) {
                     throw new InvalidArgumentException('Invalid static payload mapping');
                 }
             }

@@ -6,6 +6,7 @@ namespace SpechMedia\Sip;
 use Closure;
 use InvalidArgumentException;
 use RuntimeException;
+use SpechMedia\Media\G711Decoder;
 use SpechMedia\Net\UdpEndpoint;
 use SpechMedia\Sdp\SdpSession;
 use Swoole\Coroutine;
@@ -321,7 +322,8 @@ final class SipUserAgent
         $payloads = [];
         foreach ($codecs as $codec) {
             $payloads[] = match ($codec) {
-                'PCMA' => 8, 'PCMU' => 0, default => throw new InvalidArgumentException('Expected PCMA or PCMU')
+                'PCMA' => G711Decoder::PCMA, 'PCMU' => G711Decoder::PCMU,
+                default => throw new InvalidArgumentException('Expected PCMA or PCMU')
             };
         }
         $socket = UdpEndpoint::bind($bindIp, $mediaPort);

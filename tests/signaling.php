@@ -1,7 +1,7 @@
 <?php
 declare(strict_types=1);
 
-// SIP messages stay in memory. UDP endpoint checks only bind/connect on loopback.
+// SIP messages stay in memory. UDP endpoint checks and RTP use loopback.
 use SpechMedia\Net\UdpEndpoint;
 use SpechMedia\Sdp\SdpSession;
 use SpechMedia\Sip\SipCall;
@@ -161,9 +161,172 @@ function checkEndpoints(): void
     }
 }
 
+function sendRtp(\Swoole\Coroutine\Socket $socket, SipCall $call, int $seq, int $pt, string $payload, int $ssrc = 7): void
+{
+    $packet = pack('CCnNN', 0x80, $pt, $seq, $seq * 160, $ssrc) . $payload;
+    check($socket->sendto('127.0.0.1', $call->getLocalMediaPort(), $packet) === strlen($packet), 'Send loopback RTP');
+}
+
+function expectAudio(SipCall $call, string $expected): void
+{
+    $deadline = hrtime(true) + 1_000_000_000;
+    while ($call->getRecordedAudioBytes() < strlen($expected) && hrtime(true) < $deadline) {
+        Coroutine::sleep(0.001);
+    }
+    check($call->getBuffer() === $expected, 'Expected negotiated PCM in call ' . $call->id);
+}
+
+function checkRecording(bool $legacyAnswer = false): void
+{
+    $wire = new MemoryTransport();
+    $ua = new SipUserAgent('127.0.0.1', 'alice', 'fixture', transport: $wire, t1: 0.05, progressTimeout: 0.1);
+    $ua->start();
+    $pcma = UdpEndpoint::bind('127.0.0.1', 0);
+    $pcmu = UdpEndpoint::bind('127.0.0.1', 0);
+    $aSource = UdpEndpoint::local($pcma);
+    $bSource = UdpEndpoint::local($pcmu);
+    $wrongIp = UdpEndpoint::bind('127.0.0.2', $aSource->port);
+    $fields = [['contact', '<sip:target@pbx.test>'], ['content-type', 'application/sdp']];
+    $direction = $legacyAnswer ? 'sendrecv' : 'sendonly';
+    $aAnswer = new SdpSession($aSource->ip, $aSource->port, [8], 20, $direction);
+    $bAnswer = new SdpSession($bSource->ip, $bSource->port, [0], 30, $direction);
+    $bSdp = $legacyAnswer ? str_replace("a=sendrecv\r\n", '', $bAnswer->wire()) : $bAnswer->wire();
+    $recording = tempnam(sys_get_temp_dir(), 'spechmedia-call-');
+    try {
+        $a = $ua->createCall('600');
+        $b = $ua->createCall('601', codecs: ['PCMU'], ptime: 30);
+        $a->enableAudioRecording(allowSendrecvAnswer: $legacyAnswer);
+        $b->enableAudioRecording(maxBytes: 7, allowSendrecvAnswer: $legacyAnswer);
+        $aPort = $a->getLocalMediaPort();
+        $bPort = $b->getLocalMediaPort();
+        $done = new Channel(2);
+        $listener = static function (SipCall $call) use ($done, $recording): void {
+            $pcm = $call->getBuffer();
+            $exported = $call->saveBufferToWavFile($recording, $pcm);
+            $done->push([$call->id, $call->getMediaBindPort(), $pcm, $call->isRecordingTruncated(), $exported]);
+        };
+        $a->onHangup($listener);
+        $b->onHangup($listener);
+        $a->invite();
+        $ia = $wire->take('INVITE');
+        $b->invite();
+        $ib = $wire->take('INVITE');
+        check(SdpSession::parse($ia->body)->direction === 'recvonly' && SdpSession::parse($ia->body)->port === $aPort
+            && SdpSession::parse($ib->body)->payloads === [0] && SdpSession::parse($ib->body)->port === $bPort,
+            'Active recording offers the bound port and recvonly G.711');
+
+        sendRtp($wrongIp, $a, 10, 8, "\xaa");
+        sendRtp($pcmu, $a, 10, 8, "\xaa");
+        sendRtp($pcma, $a, 10, 0, "\x80");
+        sendRtp($pcma, $a, 11, 8, "\x54");
+        sendRtp($pcma, $a, 10, 8, "\xd5");
+        sendRtp($pcmu, $b, 1, 0, "\x80\x00");
+        sendRtp($pcmu, $b, 2, 0, "\xfe\x7e");
+        Coroutine::sleep(0.005);
+        check($a->getBuffer() === '' && $b->getBuffer() === '', 'Never decode before SDP validates the source');
+        $wire->inject(reply($ia, 183, $fields, $aAnswer->wire()));
+        expectAudio($a, pack('v*', 8, -24));
+        check($a->state() === 'proceeding', 'RTP is recorded during early media');
+
+        $aOk = reply($ia, 200, $fields);
+        $wire->inject($aOk);
+        $wire->take('ACK');
+        $wire->inject(reply($ib, 200, $fields, $bSdp));
+        $wire->take('ACK');
+        expectAudio($b, pack('v*', 32124, -32124, 8));
+        sendRtp($pcma, $a, 12, 8, "\xaa", 9);
+        sendRtp($pcma, $a, 12, 8, "\x55");
+        sendRtp($wrongIp, $a, 13, 8, "\xaa");
+        sendRtp($pcmu, $b, 3, 0, "\x80");
+        expectAudio($a, pack('v*', 8, -24, -8));
+
+        $b->hangup();
+        $wire->inject(reply($wire->take('BYE'), 200));
+        check($b->waitForEnd(1.0), 'Local BYE completes');
+        check($done->pop(1.0) === [$b->id, null, pack('v*', 32124, -32124, 8), true, true],
+            'Local hangup callback observes closed socket and independent bounded recording');
+        $remoteBye = new SipMessage('BYE sip:alice@127.0.0.1 SIP/2.0', [
+            ['via', 'SIP/2.0/UDP 127.0.0.1;branch=z9hG4bKmedia'], ['from', $aOk->header('to')],
+            ['to', $ia->header('from')], ['call-id', $a->id], ['cseq', '2 BYE']
+        ]);
+        $wire->inject($remoteBye);
+        check($wire->take('BYE')->status() === 200 && $a->waitForEnd(1.0), 'Remote BYE completes');
+        check($done->pop(1.0) === [$a->id, null, pack('v*', 8, -24, -8), false, true],
+            'Remote hangup callback observes closed socket and retained PCM');
+        check(substr(file_get_contents($recording), 44) === $a->getBuffer(), 'Hangup WAV contains the exact received PCM');
+        foreach ([$aPort, $bPort] as $port) {
+            UdpEndpoint::bind('127.0.0.1', $port)->close();
+        }
+
+        foreach ([
+            ['sendrecv', $aSource->port, [8], false, 'direction for recvonly offer: sendrecv'],
+            ['recvonly', $aSource->port, [8], true, 'direction for recvonly offer: recvonly'],
+            ['sendrecv', 0, [8], true, 'SDP port 0'],
+            ['sendrecv', $aSource->port, [18], true, 'remote PTs: 18'],
+        ] as [$answerDirection, $answerPort, $answerPts, $allowSendrecv, $reason]) {
+            $call = $ua->createCall('602');
+            $call->enableAudioRecording(allowSendrecvAnswer: $allowSendrecv);
+            $failure = new Channel(1);
+            $call->onFailed(static function (SipCall $call, ?SipMessage $message) use ($failure): void {
+                $failure->push($message);
+            });
+            $port = $call->getLocalMediaPort();
+            $call->invite();
+            $invite = $wire->take('INVITE');
+            $invalid = new SdpSession($aSource->ip, $answerPort, $answerPts, 20, $answerDirection);
+            $wire->inject(reply($invite, 200, $fields, $invalid->wire()));
+            $wire->take('ACK');
+            $wire->inject(reply($wire->take('BYE'), 200));
+            check($call->waitForEnd(1.0) && str_contains($call->reason(), $reason) && $call->getBuffer() === '',
+                "Incompatible SDP rejected with reason $reason");
+            $failedResponse = $failure->pop(1.0);
+            check($failedResponse instanceof SipMessage && $failedResponse->method() === 'INVITE'
+                && $failedResponse->body === $invalid->wire(), 'Failure callback receives the rejected INVITE answer');
+            UdpEndpoint::bind('127.0.0.1', $port)->close();
+        }
+
+        foreach (['cancel', 'busy', 'timeout', 'stopped'] as $scenario) {
+            $call = $ua->createCall('602');
+            $call->enableAudioRecording();
+            $port = $call->getLocalMediaPort();
+            $call->invite();
+            $invite = $wire->take('INVITE');
+            if ($scenario === 'busy') {
+                $wire->inject(reply($invite, 486));
+                $wire->take('ACK');
+            } elseif ($scenario === 'stopped') {
+                $ua->stop();
+            } else {
+                $wire->inject(reply($invite, 180));
+                if ($scenario === 'cancel') {
+                    $call->hangup();
+                    $wire->inject(reply($wire->take('CANCEL'), 200));
+                    $wire->inject(reply($invite, 487));
+                    $wire->take('ACK');
+                }
+            }
+            check($call->waitForEnd(1.0) && $call->getMediaBindPort() === null && $call->getBuffer() === '',
+                "Media resources released on $scenario");
+            if ($scenario === 'timeout') {
+                check($call->reason() === 'SIP timeout', 'Provisional INVITE timeout finalized the call');
+                $wire->take('CANCEL');
+            }
+            UdpEndpoint::bind('127.0.0.1', $port)->close();
+        }
+    } finally {
+        unlink($recording);
+        $ua->stop();
+        $wrongIp->close();
+        $pcmu->close();
+        $pcma->close();
+    }
+}
+
 Coroutine::set(['hook_flags' => 0]);
 Swoole\Coroutine\run(static function (): void {
     checkEndpoints();
+    checkRecording();
+    checkRecording(true);
     $wire = new MemoryTransport();
     $ua = new SipUserAgent('127.0.0.1', 'alice', 'fixture', domain: 'pbx.test', advertisedIp: '192.0.2.10', advertisedPort: 5080, transport: $wire, t1: 0.1);
     $ua->start();

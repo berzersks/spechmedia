@@ -1,8 +1,8 @@
 # SpechMedia
 
-Biblioteca e futuro motor de telefonia VoIP em PHP, compilada com [TypePHP](https://github.com/swoole/typephp) (AOT) e Swoole.
+Biblioteca de telefonia VoIP em PHP, compilada com [TypePHP](https://github.com/swoole/typephp) (AOT) e Swoole.
 
-A primeira versão origina chamadas SIP por UDP e interpreta SDP de áudio. A oferta SDP pode ser preparada automaticamente ou fornecida pela aplicação de mídia.
+O SpechMedia origina chamadas SIP por UDP e grava áudio RTP G.711 recebido do destino em WAV. A oferta SDP pode ser preparada automaticamente ou fornecida por uma aplicação que gerencie a própria mídia.
 
 ## Início rápido — Linux AMD64 / ARM64
 
@@ -41,6 +41,8 @@ bin/tpc.php example.php -O2
 ./example
 ```
 
+O exemplo salva `rec.wav` ao encerrar a chamada, se tiver recebido áudio compatível. Ele habilita `allowSendrecvAnswer` para interoperar com PBXs que respondem `sendrecv` a uma oferta `recvonly`.
+
 Dentro de uma corrotina Swoole, o fluxo mínimo é:
 
 ```php
@@ -50,6 +52,10 @@ try {
     $sip->register();
     try {
         $call = $sip->createCall('5569999999999');
+        $call->enableAudioRecording();
+        $call->onHangup(static function (SipCall $call): void {
+            $call->saveBufferToWavFile('rec.wav', $call->getBuffer());
+        });
         $call->invite();
         $call->waitForEnd();
     } finally {
@@ -86,7 +92,7 @@ O launcher reconhece o arquivo de entrada da raiz e seleciona [example.yml](exam
 
 A descoberta da rota identifica o IP de origem local. Em uma rede com NAT ela pode retornar um IP privado. Os overrides SIP e SDP são independentes e devem refletir mapeamentos alcançáveis pelo par. A biblioteca não descobre o IP público nem cria redirecionamentos de porta.
 
-A oferta automática reserva um socket UDP em `createCall()` e anuncia `a=inactive`: ainda não existe processamento RTP. Se o provedor responder com outra direção ou omitir o atributo, a chamada de sinalização pode ser atendida com a mídia local inativa. O SDP remoto permanece disponível exatamente como recebido. Ofertas explícitas continuam a exigir uma direção compatível na resposta. Chamadas simultâneas mantêm reservas independentes. Encerramento, falha, descarte de uma chamada ainda não iniciada e `stop()` liberam a reserva. Para anunciar mídia ativa gerenciada por outro componente, use um `SdpSession` explícito.
+A oferta automática reserva um socket UDP em `createCall()` e anuncia `a=inactive` por padrão. `enableAudioRecording()`, antes de `invite()`, altera a oferta para `a=recvonly` e usa esse socket para receber áudio. O SDP remoto permanece disponível exatamente como recebido. Chamadas simultâneas mantêm reservas independentes. Encerramento, falha, descarte de uma chamada ainda não iniciada e `stop()` liberam a reserva. Para mídia gerenciada por outro componente, use um `SdpSession` explícito.
 
 **Consulta sem alocação.** Durante a execução, `getLocalIp()` e `getLocalPort()` informam o socket SIP efetivo; `getServerIp()` informa o IPv4 resolvido e `getServerPort()` a porta configurada. `getAdvertisedIp()` e `getAdvertisedPort()` informam o endereço publicado. Antes de `start()` e depois de `stop()`, os getters de endpoint retornam `null`, exceto a porta configurada do servidor.
 
@@ -98,7 +104,17 @@ Na chamada, `getLocalSdp()`, `getLocalMediaIp()` e `getLocalMediaPort()` descrev
 
 `new SdpSession($ip, $porta)` oferece PCMA (8) e PCMU (0), ptime de 20 ms e direção sendrecv. Também é possível passar `SdpSession::parse($texto)` a `createCall()` para preservar um SDP preparado externamente. O perfil suportado contém um único fluxo de áudio IPv4 RTP/AVP. `remoteSdp()` fornece endereço, porta, payloads, ptime e direção **do par**. `negotiatedPayloads()` retorna a interseção G.711, na ordem da resposta. Uma resposta final pode aproveitar o SDP provisório do mesmo diálogo. Uma resposta aceita sem áudio compatível recebe ACK seguido de BYE.
 
-Esta versão pressupõe um único próximo salto UDP, com resolução IPv4 de nome e sem descoberta SRV, travessia automática de NAT, TCP, TLS ou IPv6. Não recebe novos INVITEs como UAS. PRACK/100rel, UPDATE, re-INVITE, REFER, ICE, SRTP e sessões com vários fluxos ficam para etapas futuras. A reserva UDP não envia nem processa RTP ou RTCP. Não há codificação, áudio, DTMF ou gravação.
+Esta versão pressupõe um único próximo salto UDP, com resolução IPv4 de nome. Descoberta SRV, travessia automática de NAT, TCP, TLS, IPv6, INVITEs de entrada, PRACK/100rel, UPDATE, re-INVITE, REFER, ICE, SRTP e sessões com vários fluxos ficam para etapas futuras.
+
+### Recepção RTP e gravação
+
+- A oferta `recvonly` aceita respostas `sendonly` ou `inactive` com G.711 em comum. Uma resposta `inactive` mantém a mídia suspensa. PCMA usa PT 8 e PCMU usa PT 0. O receptor aceita tamanhos de payload variáveis, de até 8.000 amostras por pacote. [RFC 3264](https://www.rfc-editor.org/rfc/rfc3264#section-6.1) · [RFC 3551](https://www.rfc-editor.org/rfc/rfc3551#section-4.5.14).
+- `enableAudioRecording(allowSendrecvAnswer: true)` também aceita uma resposta `sendrecv`, explícita ou implícita pela ausência do atributo de direção. A oferta continua `recvonly`, o motor opera somente em recepção e aplica os mesmos filtros de origem e codec.
+- O receptor começa antes do INVITE. Até 16 pacotes aguardam a primeira resposta SDP válida e só entram na gravação após validação. Early media de `180` ou `183` usa o primeiro diálogo provisório compatível. O `200 OK` pode reutilizar o SDP desse diálogo ou fornecer outro. O áudio provisório já aceito permanece na gravação.
+- A política de origem exige o IPv4 e a porta anunciados no SDP remoto. Provedores que enviam RTP de outra porta ou endereço exigem ajuste na rede ou no provedor. A sessão fixa o primeiro SSRC aceito de cada fluxo. Uma troca de origem, conjunto de payloads ou diálogo final reinicia essa seleção. RTP simétrico, RTCP e mudanças espontâneas de SSRC ficam fora desta versão.
+- Uma janela de 16 números de sequência resolve reordenação e duplicação. Pacotes atrasados para além da janela são descartados. Lacunas são omitidas do WAV e a gravação concatena as amostras recebidas em ordem de sequência. A janela é esvaziada ao terminar o fluxo.
+- `enableAudioRecording(maxBytes: 4_800_000)` define o limite de PCM por chamada. O padrão corresponde a cinco minutos de áudio mono a 8 kHz. Ao atingir o limite, a gravação preserva o início e descarta as amostras excedentes. `getRecordedAudioBytes()` consulta o tamanho sem montar a string PCM, e `isRecordingTruncated()` indica descarte por falta de espaço.
+- `getBuffer()` retorna uma string binária PCM de 16 bits little-endian e continua disponível após o encerramento. Consultar o buffer pode alocar uma cópia proporcional à gravação. `saveBufferToWavFile($arquivo, $buffer)` grava WAV somente quando chamado e retorna `false` para um buffer vazio. Nesse caso, um arquivo já existente fica intacto.
 
 ## Outros comandos
 
@@ -134,6 +150,13 @@ A primeira compilação com Swoole pode precisar construir o PHP privado; compil
 
 ## Estado de validação
 
-Já foi comprovada a compilação AOT de um Hello World e observada a inicialização dos workers Swoole após a correção manual no cache. O **novo launcher e a automação** passaram por verificações locais de sintaxe, argumentos e idempotência do patch, mas ainda precisam de validação end-to-end em uma instalação Docker limpa. Os testes de sinalização em [tests/signaling.php](tests/signaling.php) usam mensagens SIP em memória e sockets de loopback para verificar a seleção dos endpoints e o ciclo de vida das reservas. Cobrem autenticação, retransmissão, timeout, chamadas simultâneas, ACK duplicado, CANCEL cruzado com atendimento, SDP provisório e BYE remoto. A compilação do exemplo SIP e a interoperabilidade UDP com um PBX aguardam validação manual.
+Execute as suítes locais com PHP 8.5 e Swoole disponíveis:
+
+```bash
+php tests/media.php
+php tests/signaling.php
+```
+
+[tests/media.php](tests/media.php) verifica G.711, parsing e reordenação RTP, limites de gravação e a estrutura e o conteúdo do WAV. [tests/signaling.php](tests/signaling.php) usa SIP em memória e RTP sintético em sockets de loopback para verificar early media, isolamento entre chamadas, liberação das portas e retenção da gravação após BYE remoto e local. Também cobre autenticação, retransmissões, CANCEL e timeout. A interoperabilidade com um provedor SIP aguarda validação manual.
 
 Referências: [TypePHP](https://github.com/swoole/typephp) · [PHP builder](https://github.com/swoole/typephp/blob/master/docs/en/LIBPHP_INSTALLER.md).

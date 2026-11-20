@@ -18,7 +18,7 @@ function main(): void
         $prevStat = null;
 
        go(function (){
-         for ($ix = 0; $ix < 10; $ix++) {
+         for ($ix = 0; $ix < 30; $ix++) {
              // Lê apenas a primeira linha do /proc/stat (total de todas as CPUs)
              $handle = fopen('/proc/stat', 'r');
              if (!$handle) {
@@ -83,8 +83,10 @@ function main(): void
             $registered = true;
             echo "Ramal registrado. {$registration->line}\n";
 
-            // 4. Preparar a chamada. A porta UDP fica reservada, sem processamento RTP.
+            // 4. Preparar a chamada e habilitar a gravação do áudio remoto.
             $call = $sip->createCall($destination);
+            // Aceitar sendrecv de PBXs que ignoram recvonly na resposta.
+            $call->enableAudioRecording(allowSendrecvAnswer: true);
             echo "Porta reservada para mídia: " . $call->getLocalMediaPort() . "\n";
 
             // 5. Configurar os eventos antes do INVITE.
@@ -92,8 +94,16 @@ function main(): void
                 echo "Telefone tocando (180 Ringing).\n";
             });
 
-            $call->onProgress(static function (SipCall $call, ?SipMessage $message, string $reason): void {
+            $showSdp = static function (?SipMessage $message): void {
+                if ($message !== null && $message->body !== ''
+                    && strtolower(trim(explode(';', $message->header('content-type'), 2)[0])) === 'application/sdp') {
+                    $body = preg_replace('/[^\x20-\x7e\n]/', '', str_replace("\r\n", "\n", $message->body));
+                    echo 'SDP remoto em ' . $message->line . ":\n" . rtrim($body ?? '') . "\n";
+                }
+            };
+            $call->onProgress(static function (SipCall $call, ?SipMessage $message, string $reason) use ($showSdp): void {
                 echo 'Progresso SIP: ' . $message?->line . "\n";
+                $showSdp($message);
             });
 
             $call->onAnswer(static function (SipCall $call, ?SipMessage $message, string $reason) use ($seconds): void {
@@ -111,12 +121,26 @@ function main(): void
                 }
             });
 
-            $call->onHangup(static function (SipCall $call, ?SipMessage $message, string $reason): void {
+            $saveRecording = static function (SipCall $call): void {
+                try {
+                    if ($call->saveBufferToWavFile('rec.wav', $call->getBuffer())) {
+                        echo 'Gravação salva em rec.wav (' . $call->getRecordedAudioBytes() . " bytes de PCM).\n";
+                    } else {
+                        echo "Nenhum áudio RTP recebido para gravar.\n";
+                    }
+                } catch (Throwable $error) {
+                    fwrite(STDERR, 'Falha ao salvar rec.wav: ' . $error->getMessage() . "\n");
+                }
+            };
+            $call->onHangup(static function (SipCall $call, ?SipMessage $message, string $reason) use ($saveRecording): void {
                 echo "Chamada encerrada. $reason\n";
+                $saveRecording($call);
             });
 
-            $call->onFailed(static function (SipCall $call, ?SipMessage $message, string $reason): void {
+            $call->onFailed(static function (SipCall $call, ?SipMessage $message, string $reason) use ($saveRecording, $showSdp): void {
                 echo 'Falha na chamada: ' . ($message?->line ?? 'sem resposta SIP') . " ($reason)\n";
+                $showSdp($message);
+                $saveRecording($call);
                 //var_dump($call);
             });
 

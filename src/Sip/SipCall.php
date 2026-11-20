@@ -5,8 +5,12 @@ namespace SpechMedia\Sip;
 
 use Closure;
 use LogicException;
+use ReflectionFunction;
 use RuntimeException;
 use Throwable;
+use SpechMedia\Media\AudioBuffer;
+use SpechMedia\Media\MediaSession;
+use SpechMedia\Media\WavWriter;
 use SpechMedia\Net\UdpEndpoint;
 use SpechMedia\Sdp\SdpSession;
 use Swoole\Coroutine\Socket;
@@ -24,6 +28,7 @@ final class SipCall
     private bool $cancelSent = false;
     private bool $provisional = false;
     private ?SipMessage $inviteRequest = null;
+    private ?SipMessage $rejectedAnswer = null;
     private ?SipDialog $dialog = null;
     private ?SdpSession $remote = null;
     private string $earlyTag = '';
@@ -35,20 +40,23 @@ final class SipCall
     private array $events = [];
     private bool $dispatching = false;
     private Channel $end;
+    private ?MediaSession $media;
+    private bool $recording = false;
 
     public function __construct(private SipUserAgent $ua, private string $uri, private SdpSession $offer,
-        private ?Socket $mediaSocket = null, private ?UdpEndpoint $mediaBind = null)
+        ?Socket $mediaSocket = null, ?UdpEndpoint $mediaBind = null)
     {
         $this->id = $ua->newId();
         $this->tag = SipUserAgent::tag();
         $this->end = new Channel(1);
+        $this->media = $mediaSocket === null ? null : new MediaSession($mediaSocket, $mediaBind);
     }
 
     private function __clone() {}
 
     public function __destruct()
     {
-        $this->mediaSocket?->close();
+        $this->media?->close();
     }
 
     public function state(): string { return $this->state; }
@@ -59,15 +67,37 @@ final class SipCall
     public function getRemoteSdp(): ?SdpSession { return $this->remote; }
     public function getLocalMediaIp(): string { return $this->offer->address; }
     public function getLocalMediaPort(): int { return $this->offer->port; }
-    public function getMediaBindIp(): ?string { return $this->mediaBind?->ip; }
-    public function getMediaBindPort(): ?int { return $this->mediaBind?->port; }
+    public function getMediaBindIp(): ?string { return $this->media?->bound()?->ip; }
+    public function getMediaBindPort(): ?int { return $this->media?->bound()?->port; }
+
+    public function enableAudioRecording(int $maxBytes = AudioBuffer::DEFAULT_MAX_BYTES, bool $allowSendrecvAnswer = false): void
+    {
+        if ($this->state !== 'new' || $this->media === null) {
+            throw new LogicException('Enable recording before INVITE on a call with a reserved media socket');
+        }
+        $this->media->enableRecording($maxBytes, $allowSendrecvAnswer);
+        if (!$this->recording) {
+            $offer = $this->offer;
+            $this->offer = new SdpSession($offer->address, $offer->port, $offer->payloads, $offer->ptime, 'recvonly');
+            $this->recording = true;
+        }
+    }
+
+    public function getBuffer(): string { return $this->media?->pcm() ?? ''; }
+    public function getRecordedAudioBytes(): int { return $this->media?->recordedBytes() ?? 0; }
+    public function isRecordingTruncated(): bool { return $this->media?->recordingTruncated() ?? false; }
+
+    public function saveBufferToWavFile(string $filename, string $buffer): bool
+    {
+        return WavWriter::write($filename, $buffer);
+    }
 
     public function negotiatedPayloads(): array
     {
         return $this->remote?->commonPayloads($this->offer) ?? [];
     }
 
-    /** Each listener receives (SipCall, ?SipMessage, string reason). */
+    /** Listeners can declare up to three arguments (SipCall, ?SipMessage, string reason). */
     public function onRinging(Closure $listener): void { $this->listeners['ringing'] = $listener; }
     public function onProgress(Closure $listener): void { $this->listeners['progress'] = $listener; }
     public function onAnswer(Closure $listener): void { $this->listeners['answer'] = $listener; }
@@ -90,7 +120,10 @@ final class SipCall
             while ($this->events) {
                 [$callback, $message, $detail] = array_shift($this->events);
                 try {
-                    $callback($this, $message, $detail);
+                    // TypePHP closures enforce their declared arity.
+                    $signature = new ReflectionFunction($callback);
+                    $arity = $signature->isVariadic() ? 3 : $signature->getNumberOfParameters();
+                    $signature->invokeArgs(array_slice([$this, $message, $detail], 0, $arity));
                 } catch (Throwable $e) {
                     error_log('SpechMedia SIP callback failed');
                 }
@@ -107,6 +140,9 @@ final class SipCall
         $this->ua->attach($this);
         $this->state = 'calling';
         try {
+            if ($this->recording) {
+                $this->media->start();
+            }
             $this->sendInvite();
         } catch (Throwable $e) {
             $this->ended($e->getMessage(), null, true);
@@ -119,6 +155,9 @@ final class SipCall
         $fields = array_merge([['Content-Type', 'application/sdp']], $this->ua->credentials($this->auth, 'INVITE', $this->uri));
         $request = $this->ua->request('INVITE', $this->uri, $this->id, $this->tag, '<' . $this->uri . '>',
             ++$this->seq, $fields, $this->offer->wire());
+        if ($this->recording && $this->inviteRequest !== null) {
+            $this->media->resetNegotiation(true);
+        }
         $this->inviteRequest = $request;
         $this->provisional = false;
         $this->earlyTag = '';
@@ -149,13 +188,8 @@ final class SipCall
             }
             if ($status === 180 || $status === 183) {
                 $this->state = $this->cancelWanted ? 'cancelling' : 'proceeding';
-                if ($msg->body !== '') {
-                    try {
-                        $this->remote = $this->readSdp($msg);
-                        $this->earlyTag = SipMessage::parameter($msg->header('to'), 'tag');
-                    } catch (\InvalidArgumentException $e) {
-                        $this->remote = null;
-                    }
+                if ($msg->body !== '' && (!$this->recording || !$this->cancelWanted)) {
+                    $this->provisionalSdp($msg);
                 }
                 $this->emit($status === 180 ? 'ringing' : 'progress', $msg);
             }
@@ -182,6 +216,26 @@ final class SipCall
         return SdpSession::parse($msg->body);
     }
 
+    private function provisionalSdp(SipMessage $msg): void
+    {
+        $tag = SipMessage::parameter($msg->header('to'), 'tag');
+        if ($this->recording && ($tag === '' || ($this->earlyTag !== '' && $this->earlyTag !== $tag))) {
+            return;
+        }
+        try {
+            $remote = $this->readSdp($msg);
+            if ($this->recording) {
+                $this->media->applyAnswer($this->offer, $remote);
+            }
+            $this->remote = $remote;
+            $this->earlyTag = $tag;
+        } catch (\InvalidArgumentException $e) {
+            if (!$this->recording) {
+                $this->remote = null;
+            }
+        }
+    }
+
     private function accepted(SipMessage $request, SipMessage $msg): void
     {
         $seq = (int) $request->header('cseq');
@@ -200,8 +254,8 @@ final class SipCall
             }
         }
         $ack = $this->dialogRequest($dialog, 'ACK', $seq, $credentials);
-        $this->ua->sendMessage($ack);
         if ($this->dialog !== null || $this->terminal() || $request !== $this->inviteRequest) {
+            $this->ua->sendMessage($ack);
             if (count($this->forkAcks) >= 16) {
                 array_shift($this->forkAcks);
             }
@@ -213,31 +267,45 @@ final class SipCall
         $this->primaryAck = $ack;
         $this->dialog = $dialog;
         $this->state = 'answered';
-        if ($this->cancelWanted) {
-            $this->hangup();
-            return;
+        if (!$this->cancelWanted) {
+            try {
+                $this->acceptSdp($msg, $remoteTag);
+            } catch (\InvalidArgumentException | RuntimeException $e) {
+                $this->reason = $e->getMessage();
+                $this->rejectedAnswer = $msg;
+                if ($this->recording) {
+                    $this->media->resetNegotiation(false);
+                }
+            }
         }
-        try {
-            if ($msg->body !== '') {
-                $this->remote = $this->readSdp($msg);
-            } elseif ($this->earlyTag !== $remoteTag || $this->remote === null) {
-                throw new RuntimeException('Missing SDP answer');
-            }
-            // A reserved inactive endpoint never processes RTP. Keep the signaling
-            // dialog even if the peer ignores inactive or omits its direction.
-            $signalingOnly = $this->mediaSocket !== null && $this->offer->direction === 'inactive';
-            if (!$signalingOnly && !$this->remote->acceptsDirection($this->offer)) {
-                throw new RuntimeException('Incompatible SDP answer direction');
-            }
-            if (!$this->negotiatedPayloads()) {
-                throw new RuntimeException('No accepted G.711 audio stream');
-            }
-        } catch (Throwable $e) {
-            $this->reason = $e->getMessage();
+        $this->ua->sendMessage($ack);
+        if ($this->cancelWanted || $this->reason !== '') {
             $this->hangup();
             return;
         }
         $this->emit('answer', $msg);
+    }
+
+    private function acceptSdp(SipMessage $msg, string $remoteTag): void
+    {
+        if ($msg->body !== '') {
+            $this->remote = $this->readSdp($msg);
+        } elseif ($this->earlyTag !== $remoteTag || $this->remote === null) {
+            throw new RuntimeException('Missing SDP answer');
+        }
+        if ($this->recording) {
+            $newStream = $this->earlyTag !== '' && $this->earlyTag !== $remoteTag;
+            $this->media->applyAnswer($this->offer, $this->remote, $newStream);
+            return;
+        }
+        // Preserve interoperability for signaling-only calls with an automatic offer.
+        $signalingOnly = $this->media !== null && $this->offer->direction === 'inactive';
+        if (!$signalingOnly && !$this->remote->acceptsDirection($this->offer)) {
+            throw new RuntimeException('Incompatible SDP answer direction');
+        }
+        if (!$this->negotiatedPayloads()) {
+            throw new RuntimeException('No accepted G.711 audio stream');
+        }
     }
 
     private function dialogRequest(SipDialog $dialog, string $method, int $seq, array $extra): SipMessage
@@ -306,8 +374,8 @@ final class SipCall
                 if ($status >= 300 && $error === '') {
                     $error = 'BYE failed with SIP ' . $status;
                 }
-                $detail = $error !== '' ? $error : $this->reason;
-                $this->ended($detail !== '' ? $detail : 'Local BYE', $msg, $detail !== '');
+                $detail = $this->rejectedAnswer !== null ? $this->reason : $error;
+                $this->ended($detail !== '' ? $detail : 'Local BYE', $this->rejectedAnswer ?? $msg, $detail !== '');
             }
         });
     }
@@ -330,9 +398,8 @@ final class SipCall
         if (!$this->terminal()) {
             $this->reason = $reason;
             $this->state = $failed ? 'failed' : 'ended';
-            $this->mediaSocket?->close();
-            $this->mediaSocket = null;
-            $this->mediaBind = null;
+            $this->rejectedAnswer = null;
+            $this->media?->close();
             $this->ua->release($this);
             $this->emit($failed ? 'failed' : 'hangup', $msg, $reason);
             $this->end->close();
