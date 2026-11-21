@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import os
+import re
 import signal
 import statistics
 import subprocess
@@ -83,6 +84,43 @@ def summarize(record):
     }
 
 
+class OutputCpuSamples:
+    """Extrai as amostras impressas, preservando linhas parciais entre leituras."""
+
+    ansi = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
+    cpu_line = re.compile(rb"^\s*CPU Usage:\s*([0-9]+(?:[.,][0-9]+)?)\s*%\s*$")
+
+    def __init__(self):
+        self.pending = b""
+        self.samples = []
+
+    def feed(self, output, final=False):
+        lines = (self.pending + output).split(b"\n")
+        self.pending = lines.pop()
+        if final:
+            lines.append(self.pending)
+            self.pending = b""
+        for line in lines:
+            match = self.cpu_line.fullmatch(self.ansi.sub(b"", line))
+            if match:
+                value = float(match[1].replace(b",", b"."))
+                if not math.isfinite(value):
+                    raise ValueError("CPU Usage inválido na saída do programa")
+                self.samples.append(value)
+
+    def summary(self):
+        if not self.samples:
+            raise ValueError("nenhuma linha CPU Usage encontrada")
+        rates = sorted(self.samples)
+        return {
+            "Amostras de CPU Usage": len(rates),
+            "CPU média (%)": statistics.mean(rates),
+            "CPU mediana por intervalo (%)": statistics.median(rates),
+            "CPU P95 por intervalo (%)": rates[math.ceil(0.95 * len(rates)) - 1],
+            "CPU pico (%)": rates[-1],
+        }
+
+
 def audio_info(path):
     with wave.open(str(path), "rb") as audio:
         if audio.getcomptype() != "NONE" or (audio.getnchannels(), audio.getsampwidth(), audio.getframerate()) != (1, 2, 8000):
@@ -110,13 +148,17 @@ def compare(args):
     print_table(left, right)
 
 
-def print_table(left, right):
+def print_table(left, right, from_output=False):
     print(f"{'Métrica':32} {'SpechMedia AOT':>15} {'libspech/PCG':>15}")
     for key in dict.fromkeys((*left, *right)):
         aot = f"{left[key]:.3f}" if key in left else "—"
         pcg = f"{right[key]:.3f}" if key in right else "—"
         print(f"{key:32} {aot:>15} {pcg:>15}")
-    print("\n100% de CPU corresponde a um núcleo lógico. O RSS é amostrado a cada segundo.")
+    if from_output:
+        print("\nCPU calculada a partir das linhas CPU Usage impressas pelos programas.")
+        print("Média aritmética das amostras de cada programa; 100% corresponde a um núcleo lógico.")
+    else:
+        print("\n100% de CPU corresponde a um núcleo lógico. O RSS é amostrado a cada segundo.")
     base = right["CPU média (%)"]
     if base > 0:
         delta = 100 * (left["CPU média (%)"] / base - 1)
@@ -163,8 +205,8 @@ def run_pair(args):
     commands = {"aot": [aot], "pcg": [root / "examplepcg"]}
     processes = {}
     readers = {}
-    previous = {}
-    records = {}
+    cpu = {name: OutputCpuSamples() for name in commands}
+    displayed = 0
     finished = set()
     with ExitStack() as stack:
         for name, command in commands.items():
@@ -184,57 +226,45 @@ def run_pair(args):
             processes[name] = process
             stack.callback(stop_process, process)
         start = time.monotonic()
-        for name, process in processes.items():
-            previous[name] = snapshot(process.pid)
-            records[name] = {"rss_inicial_mib": previous[name][4] * PAGE_MIB, "amostras": []}
-
-        print("Janela comum desde o lançamento. 100% de CPU = um núcleo lógico.")
-        print("Tempo       CPU AOT       CPU PCG       RSS AOT       RSS PCG", flush=True)
+        print("Comparando CPU Usage impresso pelos programas (100% = um núcleo lógico).")
+        print("Amostra       CPU AOT       CPU PCG", flush=True)
         while len(finished) < len(processes):
             time.sleep(1)
             for name, process in processes.items():
                 if name in finished:
                     continue
-                output = readers[name].read()
                 code = process.poll()
+                output = readers[name].read()
+                cpu[name].feed(output, final=code is not None)
                 if code not in (None, 0) or any(msg in output for msg in (
                     b"Fatal error:", b"Erro ao registrar", b"Chamada falhou:", b"Falha na chamada:"
                 )):
                     raise ValueError(f"{name} falhou. Consulte {work / name / 'execucao.log'}")
-                # O callback de timer do PCG pode permanecer vivo após a gravação.
-                if name == "pcg" and b"Script finalizado" in output:
-                    stop_process(process)
-                    finished.add(name)
-                elif code == 0:
+                if code == 0:
                     finished.add(name)
                 if name in finished:
                     print(f"{name} finalizou.", flush=True)
             if time.monotonic() - start > args.timeout and len(finished) < len(processes):
                 raise ValueError(f"prazo de {args.timeout} s excedido. Consulte os logs em {work}")
-            if finished:
-                continue
+            # Cada linha compara a enésima amostra impressa de cada programa.
+            common = min(len(record.samples) for record in cpu.values())
+            while displayed < common:
+                print(f"{displayed + 1:7d} {cpu['aot'].samples[displayed]:12.2f}%"
+                      f" {cpu['pcg'].samples[displayed]:12.2f}%", flush=True)
+                displayed += 1
 
-            try:
-                current = {name: snapshot(proc.pid) for name, proc in processes.items()}
-            except (FileNotFoundError, ProcessLookupError, ValueError):
-                # Um dos dois pode sair entre poll() e a leitura em /proc.
-                if any(proc.poll() is not None for proc in processes.values()):
-                    continue
-                raise
-            usage = []
-            memory = []
-            for name in commands:
-                sample = interval(previous[name], current[name])
-                records[name]["amostras"].append(sample)
-                usage.append(100 * (sample["user_s"] + sample["system_s"]) / sample["wall_s"])
-                memory.append(sample["rss_mib"])
-            previous = current
-            print(f"{time.monotonic()-start:5.1f}s {usage[0]:12.1f}% {usage[1]:12.1f}%"
-                  f" {memory[0]:11.1f} MiB {memory[1]:9.1f} MiB", flush=True)
-
-    if not records["aot"]["amostras"]:
-        raise ValueError("os exemplos encerraram antes de completar um intervalo comum de 1 s")
-    left, right = summarize(records["aot"]), summarize(records["pcg"])
+    # Mostra também amostras extras quando os programas têm durações diferentes.
+    for index in range(displayed, max(len(record.samples) for record in cpu.values())):
+        values = [f"{cpu[name].samples[index]:.2f}%" if index < len(cpu[name].samples) else "—"
+                  for name in commands]
+        print(f"{index + 1:7d} {values[0]:>13} {values[1]:>13}")
+    for name, record in cpu.items():
+        if not record.samples:
+            raise ValueError(f"{name} não imprimiu CPU Usage. Consulte {work / name / 'execucao.log'}")
+        (work / name / "cpu-usage.json").write_text(
+            json.dumps({"nome": name, "cpu_usage_pct": record.samples}, indent=2, allow_nan=False) + "\n"
+        )
+    left, right = cpu["aot"].summary(), cpu["pcg"].summary()
     for name, summary in (("aot", left), ("pcg", right)):
         directory = work / name
         wav = directory / "rec.wav"
@@ -244,14 +274,14 @@ def run_pair(args):
             summary["Áudio do WAV completo (s)"] = audio_info(wav)
         else:
             print(f"{name} terminou sem WAV. Confira {directory / 'execucao.log'}.")
-    print("\nComparação final dos intervalos simultâneos")
-    print_table(left, right)
+    print("\nComparação final do CPU Usage impresso por cada programa")
+    print_table(left, right, from_output=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
-    pair = commands.add_parser("executar", help="inicia ambos os exemplos e compara a janela comum")
+    pair = commands.add_parser("executar", help="inicia ambos os exemplos e compara o CPU Usage impresso na saída")
     pair.add_argument("--timeout", type=positive_int, default=240, help="prazo dos exemplos em segundos")
     capture = commands.add_parser("medir", help="grava uma captura JSON na saída padrão")
     capture.add_argument("nome", choices=["aot", "pcg"])

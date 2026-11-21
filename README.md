@@ -127,8 +127,8 @@ Prepare o arquivo com `$alaw = AlawPlayback::loadWav($arquivo)` antes de iniciar
 ## Outros comandos
 
 ```bash
-bin/tpc.php hello.php -O3
-bin/tpc.php hello.php -o meu-programa
+bin/tpc.php examplepcg.php -O3
+bin/tpc.php examplepcg.php -o 
 
 # Exemplo existente de servidor TCP Swoole
 bin/tpc.php examples/hello.php -o swoole-server

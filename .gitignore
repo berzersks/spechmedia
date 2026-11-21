@@ -5,5 +5,7 @@
 /build/
 .idea
 example
+examplepcg
 rec.wav
 rec2.wav
+timer_probe

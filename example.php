@@ -1,6 +1,7 @@
 <?php
 declare(strict_types=1);
 
+use libspech\Cli\cli;
 use SpechMedia\Media\AlawPlayback;
 use SpechMedia\Sip\SipCall;
 use SpechMedia\Sip\SipMessage;
@@ -13,7 +14,7 @@ function main(): void
     include '/home/lotus/projetos/libspech/plugins/autoloader.php';
 
 
-    $wav = getenv('SIP_AUDIO_FILE') ?: '/home/lotus/Músicas/ARANHA_48k_mono.wav';
+    $wav = getenv('SIP_AUDIO_FILE') ?: '/home/lotus/projetos/libspech/music.wav';
     $alaw = AlawPlayback::loadWav($wav);
 
     Co\run(static function () use ($alaw): void {
@@ -21,54 +22,14 @@ function main(): void
         $registered = false;
 
 
-        $prevStat = null;
+        // CPU do processo: 100% corresponde a um núcleo ocupado.
+        // O objeto mantém as amostras entre os callbacks, inclusive no binário AOT.
+        $usage = getrusage();
+        $cpuState = new \stdClass();
+        $cpuState->lastCpuTime = ($usage['ru_utime.tv_sec'] + $usage['ru_utime.tv_usec'] / 1_000_000)
+            + ($usage['ru_stime.tv_sec'] + $usage['ru_stime.tv_usec'] / 1_000_000);
+        $cpuState->lastWallTime = hrtime(true);
 
-       go(function (){
-         for ($ix = 0; $ix < 60; $ix++) {
-             // Lê apenas a primeira linha do /proc/stat (total de todas as CPUs)
-             $handle = fopen('/proc/stat', 'r');
-             if (!$handle) {
-                 return;
-             }
-             $line = fgets($handle);
-             fclose($handle);
-
-             // Extrai os valores numéricos: user, nice, system, idle, iowait, irq, softirq, steal
-             preg_match('/^cpu\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/', $line, $matches);
-             if (empty($matches)) {
-                 return;
-             }
-
-             array_shift($matches); // Remove o match completo da string
-             $currentStat = array_map('intval', $matches);
-
-             // Na primeira execução, apenas armazena a base de comparação
-             if ($prevStat === null) {
-                 $prevStat = $currentStat;
-                 return;
-             }
-
-             // Calcula a diferença de ciclos desde o último tick (1 segundo atrás)
-             $deltas = [];
-             foreach ($currentStat as $i => $val) {
-                 $deltas[$i] = $val - $prevStat[$i];
-             }
-             $prevStat = $currentStat;
-
-             $totalDelta = array_sum($deltas);
-             if ($totalDelta === 0) {
-                 return;
-             }
-
-             // Índice 3 = idle, Índice 4 = iowait
-             $idleDelta = $deltas[3] + $deltas[4];
-             $cpuUsage = (($totalDelta - $idleDelta) / $totalDelta) * 100;
-
-             echo sprintf("$ix - Uso de CPU: %.2f%%\n", $cpuUsage);
-            Coroutine::sleep(1);
-
-         }
-       });
 
         try {
             // 1. Substitua o domínio, o ramal e a senha pelos dados do seu servidor SIP.
@@ -77,8 +38,9 @@ function main(): void
                 username: 'ramal',
                 password: 'ramal'
             );
-            $destination = '123';
+            $destination = 'AOT';
             $seconds = positiveSetting('SIP_CALL_SECONDS', '60', 86400);
+
 
             // 2. Iniciar o transporte UDP.
             $sip->start();
@@ -149,6 +111,31 @@ function main(): void
                 //var_dump($call);
             });
 
+
+            $resourceTimerId = \Swoole\Timer::tick(1000, static function ($id) use (&$call, $cpuState): void {
+                $usage = getrusage();
+                $now = hrtime(true);
+                $cpuUser = $usage['ru_utime.tv_sec'] + $usage['ru_utime.tv_usec'] / 1_000_000;
+                $cpuSystem = $usage['ru_stime.tv_sec'] + $usage['ru_stime.tv_usec'] / 1_000_000;
+                $totalCpuTime = $cpuUser + $cpuSystem;
+                $deltaTime = ($now - $cpuState->lastWallTime) / 1_000_000_000;
+                $cpuUsagePct = $deltaTime > 0
+                    ? max(0.0, ($totalCpuTime - $cpuState->lastCpuTime) / $deltaTime * 100)
+                    : 0.0;
+                $cpuState->lastCpuTime = $totalCpuTime;
+                $cpuState->lastWallTime = $now;
+                cli::pcl(strlen($call->getBuffer() ?? "")." audio bytes", 'bold_yellow');
+
+                cli::pcl("--- DEBUG de Recursos ---", "bold_cyan");
+                cli::pcl("Memória atual: " . round(memory_get_usage(true) / 1024 / 1024, 2) . " MB", "cyan");
+                cli::pcl("Memória pico: " . round(memory_get_peak_usage(true) / 1024 / 1024, 2) . " MB", "cyan");
+                cli::pcl("CPU Usage: " . round($cpuUsagePct, 2) . "%", "bold_yellow");
+                cli::pcl("CPU user: " . round($cpuUser, 2) . "s | system: " . round($cpuSystem, 2) . "s", "cyan");
+                cli::pcl("---------------------------", "bold_cyan");
+            });
+
+
+
             // 6. Enviar o INVITE.
             echo "Chamando $destination. Call-ID: {$call->id}\n";
             try {
@@ -162,6 +149,10 @@ function main(): void
         } catch (Throwable $error) {
             fwrite(STDERR, $error->getMessage() . "kkk \n");
         } finally {
+            if ($resourceTimerId !== false) {
+                \Swoole\Timer::clear($resourceTimerId);
+            }
+
             // 8. Remover o registro e liberar o transporte.
             try {
                 if ($registered) {
